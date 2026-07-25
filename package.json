@@ -1,0 +1,22 @@
+{
+  "name": "necropolis",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Wave-based first-person zombie survival built on Three.js + Rapier",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.14.0",
+    "three": "^0.185.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

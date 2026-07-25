@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Asset Preview — NECROPOLIS</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #07080c; overflow: hidden; color: #cfd4dd;
+        font-family: system-ui, sans-serif; }
+      #hud { position: fixed; top: 12px; left: 12px; z-index: 10; font-size: 13px; line-height: 1.6;
+        background: rgba(0,0,0,.5); padding: 10px 14px; border-radius: 6px; }
+      b { color: #ffb347; }
+    </style>
+  </head>
+  <body>
+    <div id="hud">
+      <b>Asset preview</b><br />
+      1-4 weapons &middot; 5 zombie &middot; 6 arms<br />
+      drag to orbit &middot; wheel to zoom
+    </div>
+    <script type="module" src="/src/dev/preview.ts"></script>
+  </body>
+</html>
