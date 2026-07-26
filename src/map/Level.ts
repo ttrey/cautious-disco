@@ -302,8 +302,10 @@ export class Level {
           tint,
           roughness: 1,
           metalness: 1,
-          normalScale: 0.9,
-          aoIntensity: 0.85,
+          // Architectural surfaces are seen at grazing angles across whole
+          // rooms; a strong normal turns concrete into stucco at that scale.
+          normalScale: 0.55,
+          aoIntensity: 0.8,
         }),
         geos: [],
       };
@@ -391,7 +393,7 @@ export class Level {
       this.addBox(
         'skyline',
         'concrete',
-        0x2b2f38,
+        0x4a5162,
         new Vector3(Math.cos(angle) * dist, height / 2 - 1, Math.sin(angle) * dist - 2),
         new Vector3(width, height, width * rng.range(0.7, 1.4)),
         0.12,
@@ -425,7 +427,7 @@ export class Level {
         0x6a6862,
         new Vector3(cx, room.height + 0.15, cz),
         new Vector3(w, 0.3, d),
-        0.45,
+        1.1,
       );
       this.physics.addStaticBox(
         new Vector3(cx, room.height + 0.15, cz),
@@ -612,7 +614,7 @@ export class Level {
 
     // One shadow-casting key per major space. Shadow maps are the single most
     // expensive thing here, so they are rationed rather than sprinkled.
-    const key = new SpotLight(0xdce8ff, 110, 30, Math.PI / 3.2, 0.5, 1.6);
+    const key = new SpotLight(0xdce8ff, 46, 30, Math.PI / 3.2, 0.62, 1.7);
     key.position.set(2, 5.2, 2);
     key.target.position.set(0, 0, 6);
     key.castShadow = true;
@@ -622,7 +624,7 @@ export class Level {
     key.shadow.camera.far = 28;
     this.root.add(key, key.target);
 
-    const key2 = new SpotLight(0xffd2a0, 130, 34, Math.PI / 3, 0.55, 1.6);
+    const key2 = new SpotLight(0xffd2a0, 58, 34, Math.PI / 3, 0.66, 1.7);
     key2.position.set(16, 6, -5);
     key2.target.position.set(16, 0, -8);
     key2.castShadow = true;

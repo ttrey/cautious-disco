@@ -48,10 +48,21 @@ export const GradePass = {
       col.g = texture2D(tDiffuse, uv).g;
       col.b = texture2D(tDiffuse, uv - centered * ca).b;
 
-      // Filmic S-curve: lifts contrast without crushing the shadow detail that
-      // carries the map's atmosphere.
-      col = clamp(col, 0.0, 4.0);
-      col = mix(col, col * col * (3.0 - 2.0 * col), 0.18);
+      // Contrast shaping.
+      //
+      // This pass runs BEFORE OutputPass, so the colour here is linear HDR and
+      // routinely exceeds 1.0 around lamps, muzzle flashes and perk signage.
+      // Applying an S-curve directly to those values sends them negative:
+      // x*x*(3-2x) is negative for every x above 1.5, which is what produces
+      // black-cored lights ringed in rainbow fringing.
+      //
+      // Instead the curve is evaluated on the 0..1 portion only and applied as
+      // a delta, so it lifts contrast in the range that carries the image and
+      // leaves highlights above 1.0 for the tone mapper to roll off.
+      col = max(col, 0.0);
+      vec3 base = min(col, vec3(1.0));
+      vec3 curved = base * base * (3.0 - 2.0 * base);
+      col += (curved - base) * 0.18;
 
       // Slight cool shadows / warm highlights split-tone.
       float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
@@ -59,7 +70,7 @@ export const GradePass = {
       col += vec3(0.010, 0.004, -0.006) * luma;
 
       // Saturation, pulled down as the player nears death.
-      col = mix(vec3(luma), col, 1.12 - uDamage * 0.55);
+      col = max(mix(vec3(luma), col, 1.12 - uDamage * 0.55), 0.0);
 
       // Vignette.
       float vig = 1.0 - uVignette * smoothstep(0.24, 0.92, r2);

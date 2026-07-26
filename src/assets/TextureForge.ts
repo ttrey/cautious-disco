@@ -286,10 +286,10 @@ function bakeConcrete(o: BakeOptions): MapSet {
     // Hairline cracks only. A wide, high-contrast crack network at this scale
     // reads as dried mud or an oil slick rather than as a poured slab.
     const crack = smoothstep(clamp((cracks(u, v) - 0.87) * 26, 0, 1));
-    const pits = smoothstep(clamp((pit(u, v) - 0.74) * 5, 0, 1));
+    const pits = smoothstep(clamp((pit(u, v) - 0.78) * 4, 0, 1));
 
     // Cold grey base, warmed slightly by staining in the low areas.
-    const base = 0.2 + g * 0.13 + bl * 0.06;
+    const base = 0.19 + g * 0.075 + bl * 0.05;
     s.r = base * 1.02;
     s.g = base;
     s.b = base * 0.96;

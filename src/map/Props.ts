@@ -156,7 +156,7 @@ export class PerkMachine implements Interactable {
     const screenMat = new MeshStandardMaterial({
       color: new Color(def.color).multiplyScalar(0.35),
       emissive: new Color(def.color),
-      emissiveIntensity: 2.6,
+      emissiveIntensity: 1.15,
       roughness: 0.25,
       metalness: 0,
     });
@@ -181,7 +181,7 @@ export class PerkMachine implements Interactable {
     this.root.add(slot);
 
     // --- Light spill: what actually sells a perk machine in a dark room ---
-    this.baseIntensity = 7;
+    this.baseIntensity = 5.5;
     this.light = new PointLight(def.color, this.baseIntensity, 9, 2);
     this.light.position.set(0, 1.3, -0.85);
     this.light.castShadow = false;
@@ -194,10 +194,10 @@ export class PerkMachine implements Interactable {
       blending: AdditiveBlending,
       depthWrite: false,
       toneMapped: false,
-      opacity: 0.5,
+      opacity: 0.16,
       side: DoubleSide,
     });
-    this.glow = new Mesh(new PlaneGeometry(2.4, 2.8), glowMat);
+    this.glow = new Mesh(new PlaneGeometry(3.0, 3.4), glowMat);
     this.glow.position.set(0, 1.2, -0.5);
     this.root.add(this.glow);
 
@@ -230,8 +230,8 @@ export class PerkMachine implements Interactable {
     const pulse = 0.82 + 0.18 * Math.sin(t);
     const glitch = Math.sin(t * 13.1) > 0.985 ? 0.35 : 1;
     this.light.intensity = this.baseIntensity * pulse * glitch;
-    (this.screen.material as MeshStandardMaterial).emissiveIntensity = 2.6 * pulse * glitch;
-    (this.glow.material as MeshBasicMaterial).opacity = 0.5 * pulse * glitch;
+    (this.screen.material as MeshStandardMaterial).emissiveIntensity = 1.15 * pulse * glitch;
+    (this.glow.material as MeshBasicMaterial).opacity = 0.16 * pulse * glitch;
   }
 }
 
@@ -578,7 +578,7 @@ export class PackAPunch implements Interactable {
       new MeshStandardMaterial({
         color: 0x2a1c4a,
         emissive: 0x8a4bff,
-        emissiveIntensity: 4.5,
+        emissiveIntensity: 1.6,
         roughness: 0.3,
       }),
     );
@@ -634,7 +634,7 @@ export class PackAPunch implements Interactable {
     this.core.rotation.x += dt * 0.3;
     const pulse = 0.75 + 0.25 * Math.sin(elapsed * 3.1);
     this.light.intensity = 9 * pulse;
-    (this.core.material as MeshStandardMaterial).emissiveIntensity = 4.5 * pulse;
+    (this.core.material as MeshStandardMaterial).emissiveIntensity = 1.6 * pulse;
     this.core.position.y = damp(this.core.position.y, 1.85 + Math.sin(elapsed * 1.6) * 0.04, 8, dt);
   }
 }
