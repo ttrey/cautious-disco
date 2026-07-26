@@ -22,6 +22,14 @@ const GRAVITY = -22;
 const PITCH_LIMIT = Math.PI / 2 - 0.02;
 
 /**
+ * `Player.position` is the point between the feet, which is what eye height,
+ * spawn points and the nav grid all want. Rapier positions a capsule by its
+ * centre, so every write to the body adds this offset. Conflating the two is
+ * how you end up spawned inside the floor.
+ */
+const capsuleCentreOffset = (halfHeight: number) => RADIUS + halfHeight;
+
+/**
  * First-person locomotion.
  *
  * Movement is velocity-based with explicit acceleration and friction rather
@@ -57,6 +65,7 @@ export class Player {
   private landingDip = 0;
   private landingVelocity = 0;
   private eyeHeight = STAND_EYE;
+  private currentHalfHeight = STAND_HALF_HEIGHT;
   private crouchBlend = 0;
   private leanRoll = 0;
   private stepDistance = 0;
@@ -80,7 +89,9 @@ export class Player {
     spawn: Vector3,
   ) {
     this.position.copy(spawn);
-    const char = physics.createCharacter(spawn, RADIUS, STAND_HALF_HEIGHT);
+    const centre = spawn.clone();
+    centre.y += capsuleCentreOffset(STAND_HALF_HEIGHT);
+    const char = physics.createCharacter(centre, RADIUS, STAND_HALF_HEIGHT);
     this.body = char.body;
     this.collider = char.collider;
     this.controller = char.controller;
@@ -101,8 +112,9 @@ export class Player {
 
   teleport(to: Vector3) {
     this.position.copy(to);
-    this.body.setNextKinematicTranslation({ x: to.x, y: to.y, z: to.z });
-    this.body.setTranslation({ x: to.x, y: to.y, z: to.z }, true);
+    const y = to.y + capsuleCentreOffset(this.currentHalfHeight);
+    this.body.setNextKinematicTranslation({ x: to.x, y, z: to.z });
+    this.body.setTranslation({ x: to.x, y, z: to.z }, true);
     this.velocity.set(0, 0, 0);
   }
 
@@ -137,15 +149,16 @@ export class Player {
 
     this.crouchBlend = damp(this.crouchBlend, this.crouching ? 1 : 0, 13, dt);
 
-    const halfHeight = lerp(STAND_HALF_HEIGHT, CROUCH_HALF_HEIGHT, this.crouchBlend);
-    this.collider.setHalfHeight(halfHeight);
+    this.currentHalfHeight = lerp(STAND_HALF_HEIGHT, CROUCH_HALF_HEIGHT, this.crouchBlend);
+    this.collider.setHalfHeight(this.currentHalfHeight);
     this.eyeHeight = lerp(STAND_EYE, CROUCH_EYE, this.crouchBlend);
   }
 
   private blockedAbove(): boolean {
-    const origin = new Vector3(this.position.x, this.position.y + 0.4, this.position.z);
-    const hit = this.physics.raycast(origin, new Vector3(0, 1, 0), 1.5, this.collider);
-    return hit !== null && hit.distance < 1.35;
+    // Cast from just above head height in the crouched pose.
+    const origin = new Vector3(this.position.x, this.position.y + 1.0, this.position.z);
+    const hit = this.physics.raycast(origin, new Vector3(0, 1, 0), 1.2, this.collider);
+    return hit !== null && hit.distance < 0.95;
   }
 
   private updateMovement(dt: number) {
@@ -236,7 +249,7 @@ export class Player {
 
     this.body.setNextKinematicTranslation({
       x: this.position.x,
-      y: this.position.y,
+      y: this.position.y + capsuleCentreOffset(this.currentHalfHeight),
       z: this.position.z,
     });
   }

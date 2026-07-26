@@ -51,18 +51,18 @@ export const GradePass = {
       // Filmic S-curve: lifts contrast without crushing the shadow detail that
       // carries the map's atmosphere.
       col = clamp(col, 0.0, 4.0);
-      col = mix(col, col * col * (3.0 - 2.0 * col), 0.28);
+      col = mix(col, col * col * (3.0 - 2.0 * col), 0.18);
 
       // Slight cool shadows / warm highlights split-tone.
       float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
-      col += vec3(-0.012, -0.004, 0.02) * (1.0 - luma);
-      col += vec3(0.02, 0.008, -0.012) * luma;
+      col += vec3(-0.005, -0.002, 0.010) * (1.0 - luma);
+      col += vec3(0.010, 0.004, -0.006) * luma;
 
       // Saturation, pulled down as the player nears death.
       col = mix(vec3(luma), col, 1.12 - uDamage * 0.55);
 
       // Vignette.
-      float vig = 1.0 - uVignette * smoothstep(0.18, 0.78, r2);
+      float vig = 1.0 - uVignette * smoothstep(0.24, 0.92, r2);
       col *= vig;
 
       // Damage overlay: arterial red creeping in from the edges, pulsing.

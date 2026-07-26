@@ -1,9 +1,11 @@
 import {
   ACESFilmicToneMapping,
-  Clock,
+  DirectionalLight,
   Fog,
-  PCFSoftShadowMap,
+  HemisphereLight,
+  PCFShadowMap,
   PerspectiveCamera,
+  PointLight,
   Scene,
   SRGBColorSpace,
   Vector2,
@@ -36,7 +38,13 @@ export class Engine {
   readonly viewCamera: PerspectiveCamera;
   readonly viewScene = new Scene();
   readonly composer: EffectComposer;
-  readonly clock = new Clock();
+  /**
+   * Frame timing. Three's `Clock` is deprecated in this version and its
+   * replacement is not part of the shipped addons, so the loop keeps its own —
+   * it is four lines and removes a dependency.
+   */
+  private lastFrameTime = 0;
+  private elapsedTime = 0;
 
   private readonly bloom: UnrealBloomPass;
   private readonly grade: ShaderPass;
@@ -62,9 +70,9 @@ export class Engine {
     // ACES gives the highlight rolloff that keeps muzzle flashes and perk neon
     // from clipping to flat white.
     this.renderer.toneMapping = ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.toneMappingExposure = 1.15;
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = PCFSoftShadowMap;
+    this.renderer.shadowMap.type = PCFShadowMap;
     container.appendChild(this.renderer.domElement);
 
     this.camera = new PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.05, 260);
@@ -72,11 +80,12 @@ export class Engine {
     // weapon, which is the object the player stares at all game.
     this.viewCamera = new PerspectiveCamera(58, window.innerWidth / window.innerHeight, 0.008, 12);
 
-    this.scene.fog = new Fog(0x0a0c12, 6, 78);
+    this.scene.fog = new Fog(0x11141d, 12, 92);
     this.scene.environment = buildEnvironment(this.renderer);
-    this.scene.environmentIntensity = 0.55;
+    this.scene.environmentIntensity = 0.85;
     this.viewScene.environment = this.scene.environment;
     this.viewScene.environmentIntensity = 0.9;
+    this.lightViewModel();
 
     this.composer = new EffectComposer(this.renderer);
     this.renderPass = new RenderPass(this.scene, this.camera);
@@ -84,9 +93,9 @@ export class Engine {
 
     this.bloom = new UnrealBloomPass(
       new Vector2(window.innerWidth, window.innerHeight),
-      0.42, // strength — enough to bloom lamps and muzzle flash, not the walls
-      0.72, // radius
-      0.82, // threshold
+      0.3, // strength — enough to bloom lamps and muzzle flash, not the walls
+      0.7, // radius
+      1.05, // threshold: only genuinely over-range pixels bloom
     );
     this.composer.addPass(this.bloom);
 
@@ -95,6 +104,29 @@ export class Engine {
     this.composer.addPass(new OutputPass());
 
     window.addEventListener('resize', this.onResize);
+  }
+
+  /**
+   * The viewmodel renders in its own scene, so it needs its own lights — world
+   * lights are not visible to it. A fixed three-point rig travelling with the
+   * camera also means the weapon reads consistently everywhere on the map,
+   * which is what you want for the object the player stares at all game.
+   */
+  private lightViewModel() {
+    const key = new DirectionalLight(0xffe6c4, 2.6);
+    key.position.set(0.6, 1.2, 0.4);
+    this.viewScene.add(key);
+
+    const fill = new DirectionalLight(0x9fc0ff, 1.1);
+    fill.position.set(-0.9, -0.2, 0.6);
+    this.viewScene.add(fill);
+
+    // Rim from behind picks out the weapon's silhouette against dark rooms.
+    const rim = new PointLight(0xffd0a0, 3.2, 4, 2);
+    rim.position.set(-0.35, 0.3, -0.8);
+    this.viewScene.add(rim);
+
+    this.viewScene.add(new HemisphereLight(0x9fb4d8, 0x2a2622, 0.7));
   }
 
   add(system: Updatable) {
@@ -116,19 +148,23 @@ export class Engine {
   start() {
     if (this.running) return;
     this.running = true;
-    this.clock.start();
     this.renderer.setAnimationLoop(this.frame);
   }
 
   stop() {
     this.running = false;
+    this.lastFrameTime = 0;
     this.renderer.setAnimationLoop(null);
   }
 
   private frame = () => {
+    const now = performance.now() / 1000;
+    if (this.lastFrameTime === 0) this.lastFrameTime = now;
     // Clamped so an alt-tab or a GC pause can't teleport entities through walls.
-    const dt = Math.min(this.clock.getDelta(), 0.05);
-    const elapsed = this.clock.elapsedTime;
+    const dt = Math.min(now - this.lastFrameTime, 0.05);
+    this.lastFrameTime = now;
+    this.elapsedTime += dt;
+    const elapsed = this.elapsedTime;
 
     this.grade.uniforms.uTime.value = elapsed;
 

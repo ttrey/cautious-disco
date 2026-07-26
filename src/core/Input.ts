@@ -1,3 +1,8 @@
+/** No legitimate single mouse event moves more than this many pixels. */
+const MAX_MOVEMENT_PER_EVENT = 180;
+const clampDelta = (v: number) =>
+  Number.isFinite(v) ? Math.max(-MAX_MOVEMENT_PER_EVENT, Math.min(MAX_MOVEMENT_PER_EVENT, v)) : 0;
+
 /**
  * Keyboard / mouse input with pointer lock.
  *
@@ -44,7 +49,15 @@ export class Input {
   }
 
   requestLock() {
-    this.element.requestPointerLock();
+    // Pointer lock can reject (no user gesture, another element holds it, or
+    // the browser is between transitions). It must never take the caller down
+    // with it — the game is perfectly playable while the request retries.
+    try {
+      const result = this.element.requestPointerLock() as unknown as Promise<void> | undefined;
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch {
+      /* ignored — handleLockChange reports the real state */
+    }
   }
 
   releaseLock() {
@@ -100,8 +113,13 @@ export class Input {
 
   private handleMouseMove = (e: MouseEvent) => {
     if (!this.locked) return;
-    this.lookX += e.movementX * this.sensitivity;
-    this.lookY += e.movementY * this.sensitivity * (this.invertY ? -1 : 1);
+    // Browsers routinely emit one enormous delta on the frame pointer lock
+    // engages (the jump from the cursor's screen position to the lock origin).
+    // Unclamped, that single event snaps the player's view to the ceiling.
+    const dx = clampDelta(e.movementX);
+    const dy = clampDelta(e.movementY);
+    this.lookX += dx * this.sensitivity;
+    this.lookY += dy * this.sensitivity * (this.invertY ? -1 : 1);
   };
 
   private handleMouseDown = (e: MouseEvent) => {
@@ -125,6 +143,9 @@ export class Input {
 
   private handleLockChange = () => {
     this.locked = document.pointerLockElement === this.element;
+    // Drop any look delta banked across the transition.
+    this.lookX = 0;
+    this.lookY = 0;
     if (!this.locked) this.handleBlur();
     this.onLockChange?.(this.locked);
   };

@@ -368,10 +368,12 @@ function bakeBrick(o: BakeOptions): MapSet {
     // Per-brick colour variation across a fired-clay range.
     const h = cellHash(cell);
     const h2 = cellHash(cell, 7);
-    const red = lerp(0.16, 0.34, h);
+    // Fired clay is a desaturated red-brown, not pillarbox red; the green and
+    // blue channels have to carry real weight or the wall glows.
+    const red = lerp(0.15, 0.28, h);
     let r = red * (0.85 + g * 0.3);
-    let gg = red * (0.42 + h2 * 0.12) * (0.85 + g * 0.3);
-    let b = red * (0.3 + h2 * 0.1) * (0.85 + g * 0.3);
+    let gg = red * (0.62 + h2 * 0.12) * (0.85 + g * 0.3);
+    let b = red * (0.5 + h2 * 0.1) * (0.85 + g * 0.3);
 
     // Soot and weathering.
     const soot = smoothstep(clamp((w - 0.55) * 3, 0, 1)) * 0.6;
