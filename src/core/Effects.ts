@@ -85,20 +85,31 @@ class ParticleSystem {
   private readonly col: Float32Array;
   private readonly size: Float32Array;
   private readonly alpha: Float32Array;
+  private readonly posAttribute: Float32BufferAttribute;
+  private readonly colAttribute: Float32BufferAttribute;
+  private readonly sizeAttribute: Float32BufferAttribute;
+  private readonly alphaAttribute: Float32BufferAttribute;
   private readonly state: ParticleState;
   private cursor = 0;
+  private colorDirtyMin: number;
+  private colorDirtyMax = -1;
 
   constructor(map: Texture, additive: boolean, private readonly capacity: number) {
     this.pos = new Float32Array(capacity * 3);
     this.col = new Float32Array(capacity * 3);
     this.size = new Float32Array(capacity);
     this.alpha = new Float32Array(capacity);
+    this.colorDirtyMin = capacity;
 
-    this.geo.setAttribute('position', new Float32BufferAttribute(this.pos, 3));
-    this.geo.setAttribute('aColor', new Float32BufferAttribute(this.col, 3));
-    this.geo.setAttribute('aSize', new Float32BufferAttribute(this.size, 1));
-    this.geo.setAttribute('aAlpha', new Float32BufferAttribute(this.alpha, 1));
-    this.geo.setDrawRange(0, capacity);
+    this.posAttribute = new Float32BufferAttribute(this.pos, 3);
+    this.colAttribute = new Float32BufferAttribute(this.col, 3);
+    this.sizeAttribute = new Float32BufferAttribute(this.size, 1);
+    this.alphaAttribute = new Float32BufferAttribute(this.alpha, 1);
+    this.geo.setAttribute('position', this.posAttribute);
+    this.geo.setAttribute('aColor', this.colAttribute);
+    this.geo.setAttribute('aSize', this.sizeAttribute);
+    this.geo.setAttribute('aAlpha', this.alphaAttribute);
+    this.geo.setDrawRange(0, 0);
     // Particles move far from the origin; a stale bounding sphere would cull
     // the whole system.
     this.geo.boundingSphere = null;
@@ -151,6 +162,8 @@ class ParticleSystem {
     this.col[i * 3] = color.r;
     this.col[i * 3 + 1] = color.g;
     this.col[i * 3 + 2] = color.b;
+    this.colorDirtyMin = Math.min(this.colorDirtyMin, i);
+    this.colorDirtyMax = Math.max(this.colorDirtyMax, i);
 
     const s = this.state;
     s.vx[i] = vx;
@@ -169,8 +182,13 @@ class ParticleSystem {
 
   update(dt: number) {
     const s = this.state;
+    let dirtyMin = this.capacity;
+    let dirtyMax = -1;
+    let highestActive = -1;
     for (let i = 0; i < this.capacity; i++) {
       if (!s.active[i]) continue;
+      dirtyMin = Math.min(dirtyMin, i);
+      dirtyMax = i;
       s.life[i] -= dt;
       if (s.life[i] <= 0) {
         s.active[i] = 0;
@@ -178,6 +196,7 @@ class ParticleSystem {
         this.size[i] = 0;
         continue;
       }
+      highestActive = i;
       const decay = Math.max(0, 1 - s.drag[i] * dt);
       s.vx[i] *= decay;
       s.vz[i] *= decay;
@@ -192,10 +211,28 @@ class ParticleSystem {
       // Fade in fast, out slowly — reads as energy dissipating.
       this.alpha[i] = t < 0.12 ? t / 0.12 : 1 - (t - 0.12) / 0.88;
     }
-    this.geo.attributes.position.needsUpdate = true;
-    this.geo.attributes.aSize.needsUpdate = true;
-    this.geo.attributes.aAlpha.needsUpdate = true;
-    this.geo.attributes.aColor.needsUpdate = true;
+    this.geo.setDrawRange(0, highestActive + 1);
+    this.markUpdate(this.posAttribute, dirtyMin, dirtyMax, 3);
+    this.markUpdate(this.sizeAttribute, dirtyMin, dirtyMax, 1);
+    this.markUpdate(this.alphaAttribute, dirtyMin, dirtyMax, 1);
+    this.markUpdate(this.colAttribute, this.colorDirtyMin, this.colorDirtyMax, 3);
+    this.colorDirtyMin = this.capacity;
+    this.colorDirtyMax = -1;
+  }
+
+  private markUpdate(
+    attribute: Float32BufferAttribute,
+    firstParticle: number,
+    lastParticle: number,
+    itemSize: number,
+  ) {
+    if (lastParticle < firstParticle) return;
+    attribute.clearUpdateRanges();
+    attribute.addUpdateRange(
+      firstParticle * itemSize,
+      (lastParticle - firstParticle + 1) * itemSize,
+    );
+    attribute.needsUpdate = true;
   }
 }
 
@@ -210,12 +247,17 @@ interface Decal {
 interface Tracer {
   mesh: Mesh;
   life: number;
+  maxLife: number;
+  opacity: number;
 }
 
 const COL_SPARK = new Color(0xffb257);
 const COL_BLOOD = new Color(0x6e0d0d);
 const COL_BLOOD_DARK = new Color(0x3a0606);
 const COL_SMOKE = new Color(0x6f6a63);
+const COL_PLASMA = new Color(0x62f4ff);
+const COL_PLASMA_EDGE = new Color(0x227bff);
+const COL_ARC = new Color(0xb29aff);
 
 export class Effects {
   private readonly additive: ParticleSystem;
@@ -341,8 +383,12 @@ export class Effects {
     );
   }
 
-  /** Visible round in flight. Only a fraction of shots should get one. */
-  tracer(from: Vector3, to: Vector3) {
+  /**
+   * Visible round in flight. Ballistic weapons call this on a minority of
+   * shots; wonder weapons pass their own colour, width and lifetime so their
+   * projectiles read as energy without needing a second effect system.
+   */
+  tracer(from: Vector3, to: Vector3, color = 0xffd9a0, width = 0.05, life = 0.055) {
     let mesh = this.tracerPool.pop();
     if (!mesh) {
       mesh = new Mesh(
@@ -361,13 +407,91 @@ export class Effects {
     }
     const length = from.distanceTo(to);
     mesh.position.copy(from).add(to).multiplyScalar(0.5);
-    mesh.scale.set(0.05, length, 1);
+    mesh.scale.set(width, length, 1);
     // Orient the quad's +Y along the shot line.
     this.tmp.copy(to).sub(from).normalize();
     mesh.quaternion.setFromUnitVectors(this.tmp2.set(0, 1, 0), this.tmp);
-    (mesh.material as MeshBasicMaterial).opacity = 0.85;
+    const mat = mesh.material as MeshBasicMaterial;
+    mat.color.setHex(color);
+    mat.opacity = 0.92;
     this.scene.add(mesh);
-    this.tracers.push({ mesh, life: 0.055 });
+    this.tracers.push({ mesh, life, maxLife: life, opacity: 0.92 });
+  }
+
+  /** Heavy cyan bolt and ionised impact for the Aether-9. */
+  plasmaBolt(from: Vector3, to: Vector3) {
+    this.tracer(from, to, 0x62f4ff, 0.105, 0.13);
+  }
+
+  /**
+   * A short-lived radial burst used both when plasma impacts scenery and when
+   * it catches a group. It lives in the shared particle batch, so a crowd hit
+   * does not allocate meshes or add draw calls.
+   */
+  plasmaBurst(point: Vector3, intensity = 1) {
+    const n = Math.round(16 * intensity);
+    for (let i = 0; i < n; i++) {
+      this.tmp
+        .set(this.rng.range(-1, 1), this.rng.range(-0.45, 1), this.rng.range(-1, 1))
+        .normalize()
+        .multiplyScalar(this.rng.range(1.8, 5.8) * intensity);
+      this.additive.spawn(
+        point.x, point.y, point.z,
+        this.tmp.x, this.tmp.y, this.tmp.z,
+        this.rng.chance(0.72) ? COL_PLASMA : COL_PLASMA_EDGE,
+        this.rng.range(0.018, 0.052) * intensity, 0.003,
+        this.rng.range(0.22, 0.46),
+        -0.5, 2.3,
+      );
+    }
+  }
+
+  /**
+   * Jagged violet bolt assembled from a handful of short additive tracers.
+   * The offsets are kept around the direct line, so the arc still clearly
+   * communicates which zombie is passing the charge to which neighbour.
+   */
+  lightningArc(from: Vector3, to: Vector3) {
+    const direction = new Vector3().subVectors(to, from);
+    const distance = direction.length();
+    if (distance < 0.001) return;
+    direction.divideScalar(distance);
+    const side = new Vector3().crossVectors(direction, new Vector3(0, 1, 0));
+    if (side.lengthSq() < 1e-5) side.crossVectors(direction, new Vector3(1, 0, 0));
+    side.normalize();
+    const up = new Vector3().crossVectors(side, direction).normalize();
+    const segments = this.rng.int(4, 7);
+    const previous = from.clone();
+
+    for (let i = 1; i <= segments; i++) {
+      const t = i / segments;
+      const next = i === segments
+        ? to.clone()
+        : from.clone()
+          .addScaledVector(direction, distance * t)
+          .addScaledVector(side, this.rng.range(-0.19, 0.19))
+          .addScaledVector(up, this.rng.range(-0.19, 0.19));
+      this.tracer(previous, next, 0xb29aff, 0.026, 0.105);
+      previous.copy(next);
+    }
+  }
+
+  /** Compact electric impact, used at each successful chain link. */
+  electricBurst(point: Vector3) {
+    for (let i = 0; i < 9; i++) {
+      this.tmp
+        .set(this.rng.range(-1, 1), this.rng.range(-0.2, 1), this.rng.range(-1, 1))
+        .normalize()
+        .multiplyScalar(this.rng.range(0.7, 2.7));
+      this.additive.spawn(
+        point.x, point.y, point.z,
+        this.tmp.x, this.tmp.y, this.tmp.z,
+        COL_ARC,
+        this.rng.range(0.012, 0.032), 0.002,
+        this.rng.range(0.11, 0.25),
+        -0.2, 3.1,
+      );
+    }
   }
 
   private addDecal(
@@ -422,7 +546,7 @@ export class Effects {
       const t = this.tracers[i];
       t.life -= dt;
       const mat = t.mesh.material as MeshBasicMaterial;
-      mat.opacity = clamp(t.life / 0.055, 0, 1) * 0.85;
+      mat.opacity = clamp(t.life / t.maxLife, 0, 1) * t.opacity;
       if (t.life <= 0) {
         this.scene.remove(t.mesh);
         this.tracers.splice(i, 1);

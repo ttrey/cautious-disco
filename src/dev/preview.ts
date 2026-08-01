@@ -8,7 +8,7 @@ import {
   Mesh,
   MeshStandardMaterial,
   Object3D,
-  PCFSoftShadowMap,
+  PCFShadowMap,
   PerspectiveCamera,
   PlaneGeometry,
   PointLight,
@@ -18,8 +18,22 @@ import {
   WebGLRenderer,
 } from 'three';
 import { buildEnvironment } from '../core/Environment';
-import { buildPistol, buildRifle, buildShotgun, buildSmg } from '../weapons/GunSmith';
+import {
+  buildBarrettM82A1,
+  buildAether9,
+  buildDesertEagle,
+  buildPistol,
+  buildRifle,
+  buildScar,
+  buildShotgun,
+  buildSmg,
+  buildSpas12,
+  buildM240,
+  buildStormweaver,
+} from '../weapons/GunSmith';
 import { buildArms } from '../weapons/Arms';
+import { ViewModel } from '../weapons/ViewModel';
+import { WEAPONS } from '../weapons/WeaponDefs';
 import { buildZombieMesh } from '../zombies/ZombieMesh';
 import { makeSurface } from '../assets/Materials';
 
@@ -39,7 +53,7 @@ renderer.outputColorSpace = SRGBColorSpace;
 renderer.toneMapping = ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = PCFSoftShadowMap;
+renderer.shadowMap.type = PCFShadowMap;
 document.body.appendChild(renderer.domElement);
 
 const scene = new Scene();
@@ -102,13 +116,52 @@ function show(builder: () => Object3D, label: string) {
   document.getElementById('hud')!.querySelector('b')!.textContent = label;
 }
 
+/**
+ * Live first-person viewmodel — the gun with both hands solved onto it by the
+ * real `ViewModel`, not a static mock.
+ *
+ * A gun on its own says nothing about whether the player is *holding* it: the
+ * grip is produced by IK and a hand basis that only exist in `ViewModel`, so a
+ * mock would just reproduce whatever the mock's author believed. This runs the
+ * shipping code and lets the turntable orbit the result.
+ */
+let vm: ViewModel | null = null;
+let vmWeapon = 'pistol';
+let previewShotIndex = 0;
+const vmCamera = new PerspectiveCamera(58, 1, 0.01, 10);
+
+function buildViewModel(): Object3D {
+  vm?.dispose();
+  vm = new ViewModel(scene);
+  vm.equip(WEAPONS[vmWeapon]);
+  previewShotIndex = 0;
+  // Settle the springs and blends so the pose is the steady-state one rather
+  // than whatever the first frame of a weapon swap looks like.
+  for (let i = 0; i < 90; i++) {
+    vm.update(1 / 60, vmCamera, {
+      lookX: 0, lookY: 0, moveIntensity: 0, bobPhase: 0,
+      bobAmount: 0, sprinting: false, inspecting: false,
+    });
+  }
+  scene.remove(vm.root);
+  return vm.root;
+}
+
 const builders: Record<string, [() => Object3D, string]> = {
   Digit1: [() => buildPistol().root, 'M9 Sidearm'],
   Digit2: [() => buildSmg().root, 'MP-40K SMG'],
   Digit3: [() => buildRifle().root, 'M4 Carbine'],
   Digit4: [() => buildShotgun().root, 'Trench Sweeper'],
-  Digit5: [() => buildZombieMesh(0).root, 'Zombie'],
-  Digit6: [
+  Digit5: [() => buildDesertEagle().root, 'Desert Eagle .50 AE'],
+  Digit6: [() => buildBarrettM82A1().root, 'Barrett M82A1'],
+  Digit7: [() => buildSpas12().root, 'SPAS-12'],
+  Digit8: [() => buildM240().root, 'M240'],
+  Digit0: [() => buildScar().root, 'FN SCAR-H'],
+  KeyU: [() => buildAether9().root, 'Aether-9'],
+  KeyI: [() => buildStormweaver().root, 'Stormweaver'],
+  Digit9: [buildViewModel, 'Viewmodel — hands on the weapon'],
+  KeyZ: [() => buildZombieMesh(0).root, 'Zombie'],
+  KeyA: [
     () => {
       const g = new Group();
       const arms = buildArms();
@@ -121,9 +174,42 @@ const builders: Record<string, [() => Object3D, string]> = {
   ],
 };
 
+const viewmodelWeapons: Record<string, string> = {
+  Digit1: 'pistol',
+  Digit2: 'smg',
+  Digit3: 'rifle',
+  Digit4: 'shotgun',
+  Digit5: 'desertEagle',
+  Digit6: 'barrettM82A1',
+  Digit7: 'spas12',
+  Digit8: 'm240',
+  Digit0: 'fnScar',
+  KeyU: 'aether9',
+  KeyI: 'stormweaver',
+};
+
 show(builders.Digit3[0], builders.Digit3[1]);
 
 addEventListener('keydown', (e) => {
+  const viewmodelWeapon = viewmodelWeapons[e.code];
+  if (e.shiftKey && viewmodelWeapon) {
+    vmWeapon = viewmodelWeapon;
+    show(buildViewModel, `Viewmodel — ${WEAPONS[vmWeapon].name}`);
+    return;
+  }
+  // Turntable-only action checks. These call the shipping ViewModel methods so
+  // a model review can catch a misplaced ejection port, feed cover or reload
+  // pivot without introducing a debug purchase path into the game itself.
+  if (e.code === 'KeyF' && vm?.root.parent === stage) {
+    vm.fire(WEAPONS[vmWeapon], ++previewShotIndex);
+    return;
+  }
+  if (e.code === 'KeyR' && vm?.root.parent === stage && !vm.reloading) {
+    const def = WEAPONS[vmWeapon];
+    if (def.shellReload) vm.startShellInsert(def.reloadTime);
+    else vm.startReload(def.reloadTime + def.emptyReloadExtra, true);
+    return;
+  }
   const b = builders[e.code];
   if (b) show(b[0], b[1]);
 });
@@ -133,6 +219,7 @@ let yaw = 0.9;
 let pitch = 0.22;
 let zoom = 1;
 let dragging = false;
+let lastFrame = performance.now();
 renderer.domElement.addEventListener('pointerdown', () => (dragging = true));
 addEventListener('pointerup', () => (dragging = false));
 addEventListener('pointermove', (e) => {
@@ -155,9 +242,46 @@ addEventListener('wheel', (e) => {
     pitch = p;
     zoom = z;
   },
+  /**
+   * Points the orbit at an explicit world position at an explicit distance.
+   *
+   * `setView` orbits the current asset's bounding-box centre, which for the
+   * viewmodel is somewhere in the middle of a forearm — useless for judging a
+   * grip 400 mm away at the far end of the assembly.
+   */
+  focus: (x: number, y: number, z: number, dist: number) => {
+    target.set(x, y, z);
+    radius = dist;
+    zoom = 1;
+  },
+  /** Re-solves the viewmodel with a different weapon, or aiming down sights. */
+  viewmodel: (weapon = 'pistol', aiming = false) => {
+    vmWeapon = weapon;
+    show(() => {
+      const root = buildViewModel();
+      vm!.setAiming(aiming);
+      for (let i = 0; i < 60; i++) {
+        vm!.update(1 / 60, vmCamera, {
+          lookX: 0, lookY: 0, moveIntensity: 0, bobPhase: 0,
+          bobAmount: 0, sprinting: false, inspecting: false,
+        });
+      }
+      scene.remove(vm!.root);
+      return root;
+    }, `Viewmodel — ${WEAPONS[weapon].name}${aiming ? ' (ADS)' : ''}`);
+  },
 };
 
 function frame() {
+  const now = performance.now();
+  const dt = Math.min((now - lastFrame) / 1000, 0.05);
+  lastFrame = now;
+  if (vm?.root.parent === stage) {
+    vm.update(dt, vmCamera, {
+      lookX: 0, lookY: 0, moveIntensity: 0, bobPhase: 0,
+      bobAmount: 0, sprinting: false, inspecting: false,
+    });
+  }
   const d = radius * zoom;
   camera.position.set(
     target.x + Math.sin(yaw) * Math.cos(pitch) * d,

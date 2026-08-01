@@ -26,10 +26,13 @@ export interface RayHit {
 }
 
 const tmpVec = new Vector3();
+export const PHYSICS_STEP = 1 / 60;
+export const MAX_PHYSICS_SUBSTEPS = 4;
 
 export class Physics {
   world!: RAPIER.World;
   private static ready = false;
+  private accumulator = 0;
 
   /** Rapier's WASM must be initialised before any other call. */
   static async init(): Promise<Physics> {
@@ -39,8 +42,7 @@ export class Physics {
     }
     const p = new Physics();
     p.world = new RAPIER.World({ x: 0, y: -22, z: 0 });
-    // 60 Hz fixed step; the engine feeds it a clamped delta.
-    p.world.integrationParameters.dt = 1 / 60;
+    p.world.integrationParameters.dt = PHYSICS_STEP;
     return p;
   }
 
@@ -120,8 +122,21 @@ export class Physics {
     };
   }
 
-  step() {
-    this.world.step();
+  /** Advances at 60 Hz regardless of render FPS, with a bounded catch-up cost. */
+  step(frameDt: number): number {
+    const boundedDt = Math.max(0, Math.min(frameDt, PHYSICS_STEP * MAX_PHYSICS_SUBSTEPS));
+    this.accumulator = Math.min(
+      this.accumulator + boundedDt,
+      PHYSICS_STEP * MAX_PHYSICS_SUBSTEPS,
+    );
+
+    let steps = 0;
+    while (this.accumulator + Number.EPSILON >= PHYSICS_STEP && steps < MAX_PHYSICS_SUBSTEPS) {
+      this.world.step();
+      this.accumulator -= PHYSICS_STEP;
+      steps++;
+    }
+    return steps;
   }
 }
 

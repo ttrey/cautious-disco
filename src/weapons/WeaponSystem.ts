@@ -1,12 +1,13 @@
-import { PerspectiveCamera, Scene, Vector3 } from 'three';
+import { PerspectiveCamera, Scene, Texture, Vector3 } from 'three';
+import type RAPIER from '@dimforge/rapier3d-compat';
 import { STARTING_WEAPON, WEAPONS, WeaponDef } from './WeaponDefs';
 import { ViewModel } from './ViewModel';
 import { Input } from '../core/Input';
 import { Physics } from '../core/Physics';
 import { Effects } from '../core/Effects';
-import { ZombieManager } from '../zombies/ZombieManager';
+import { ZombieDamageEvent, ZombieManager } from '../zombies/ZombieManager';
 import { AudioEngine } from '../audio/AudioEngine';
-import { Rng, clamp, damp } from '../util/math';
+import { Rng, clamp, damp, lerp } from '../util/math';
 
 /**
  * Weapon inventory and firing.
@@ -35,13 +36,26 @@ const _origin = new Vector3();
 const _dir = new Vector3();
 const _spread = new Vector3();
 const _end = new Vector3();
+const _muzzle = new Vector3();
 const _right = new Vector3();
 const _up = new Vector3(0, 1, 0);
 
 /** Points model, mirroring the classic economy. */
-const POINTS_HIT = 10;
-const POINTS_KILL = 60;
-const POINTS_HEADSHOT_KILL = 100;
+/**
+ * The economy. Exported because co-op has to pay a kill out from the host,
+ * which is a different code path arriving at the same number — and a second
+ * copy of these three values is a bug waiting for the day one of them is
+ * tuned.
+ */
+export const POINTS_HIT = 10;
+export const POINTS_KILL = 60;
+export const POINTS_HEADSHOT_KILL = 100;
+
+/**
+ * Field-of-view pull-in applied to the world camera while looking through an
+ * optic. Deliberately small: the tube supplies the magnification.
+ */
+const OPTIC_HOST_ZOOM = 1.1;
 
 export class WeaponSystem {
   readonly slots: WeaponSlot[] = [];
@@ -58,9 +72,23 @@ export class WeaponSystem {
   private pendingSwap = -1;
   private readonly rng = new Rng(0x9f1e);
 
+  /**
+   * Base fields of view, captured on the first update.
+   *
+   * Aiming has to actually magnify or a telescopic sight is decoration: the
+   * scope was drawn, its eye relief was tuned, and looking through it showed
+   * the target at exactly the size it was without it. Only the *world* camera
+   * narrows — the viewmodel keeps its own field so the weapon and the optic
+   * around the sight picture stay the size the player's hands put them, which
+   * is what makes the magnification read as happening inside the tube.
+   */
+  private baseFov = 0;
+
   /** Set by perks. */
   reloadSpeedMultiplier = 1;
   fireRateMultiplier = 1;
+  spreadMultiplier = 1;
+  recoilMultiplier = 1;
 
   onPointsEarned?: (points: number, reason: 'hit' | 'kill' | 'headshot') => void;
   onHitmarker?: (kill: boolean, headshot: boolean) => void;
@@ -72,6 +100,12 @@ export class WeaponSystem {
     private readonly zombies: ZombieManager,
     private readonly effects: Effects,
     private readonly audio: AudioEngine,
+    /**
+     * The player's own capsule. The camera sits inside it, so every shot would
+     * otherwise report a world hit at zero distance — walls in front of your
+     * face, and no round ever reaching a zombie.
+     */
+    private readonly playerCollider: RAPIER.Collider,
   ) {
     this.viewModel = new ViewModel(viewScene);
     this.reset();
@@ -94,6 +128,24 @@ export class WeaponSystem {
 
   get isReloading() {
     return this.reloading;
+  }
+
+  /**
+   * Rounds fired this session, ever-increasing.
+   *
+   * Sent in the player snapshot as a counter rather than a "firing" flag, so a
+   * teammate's rifle plays the right number of shots however the packets
+   * arrived. See the note on events in `RemotePlayer`.
+   */
+  get shotsFired() {
+    return this.shotIndex;
+  }
+
+  /** 0..1 through the current reload, for a teammate's reload animation. */
+  get reloadProgress() {
+    if (!this.reloading) return 0;
+    const total = this.active.def.reloadTime / this.reloadSpeedMultiplier;
+    return total > 0 ? clamp(1 - this.reloadTimer / total, 0, 1) : 0;
   }
 
   get ammoFull() {
@@ -220,6 +272,7 @@ export class WeaponSystem {
     let degrees = def.spread;
     degrees *= 1 + moveIntensity * (def.movementSpread - 1) * 0.6;
     degrees *= 1 - this.viewModel.adsBlend * (1 - def.adsSpreadMultiplier);
+    degrees *= this.spreadMultiplier;
     if (crouching) degrees *= 0.72;
     return (degrees * Math.PI) / 180;
   }
@@ -242,12 +295,29 @@ export class WeaponSystem {
     camera.getWorldPosition(_origin);
     camera.getWorldDirection(_dir);
     _right.crossVectors(_dir, _up).normalize();
+    // Tracers are drawn from the muzzle, not the eye — a round that leaves the
+    // bridge of your nose reads as a bug even when the hit is correct.
+    this.viewModel.muzzleWorld(camera, _muzzle);
 
     const cone = this.spreadRadians(moveIntensity, crouching);
     let hits = 0;
     let headshots = 0;
     let kills = 0;
     let points = 0;
+
+    const registerEvents = (events: ZombieDamageEvent[]) => {
+      for (const e of events) {
+        hits++;
+        if (e.headshot) headshots++;
+        if (e.killed) {
+          kills++;
+          points += e.headshot ? POINTS_HEADSHOT_KILL : POINTS_KILL;
+        } else {
+          points += POINTS_HIT;
+        }
+        this.audio.fleshHit(e.point, e.killed);
+      }
+    };
 
     for (let pellet = 0; pellet < def.pellets; pellet++) {
       // Sample the cone with a square-root radius so pellets are distributed
@@ -261,7 +331,7 @@ export class WeaponSystem {
         .normalize();
 
       // World geometry first: it clips how far the round can reach.
-      const worldHit = this.physics.raycast(_origin, _spread, def.range);
+      const worldHit = this.physics.raycast(_origin, _spread, def.range, this.playerCollider);
       const maxDist = worldHit ? worldHit.distance : def.range;
 
       const events = this.zombies.fireRay(
@@ -273,29 +343,61 @@ export class WeaponSystem {
         def.penetration,
       );
 
+      const beforeHits = hits;
+      const beforeKills = kills;
+      const beforeHeadshots = headshots;
+
       if (events.length > 0) {
-        for (const e of events) {
-          hits++;
-          if (e.headshot) headshots++;
-          if (e.killed) {
-            kills++;
-            points += e.headshot ? POINTS_HEADSHOT_KILL : POINTS_KILL;
-          } else {
-            points += POINTS_HIT;
-          }
-          this.audio.fleshHit(e.point, e.killed);
-        }
-        // Only one impact sound and marker per trigger pull, not per pellet.
-        if (pellet === 0) this.onHitmarker?.(kills > 0, headshots > 0);
+        registerEvents(events);
       } else if (worldHit) {
         this.effects.impact(worldHit.point, worldHit.normal, true);
         if (pellet === 0) this.audio.ricochet(worldHit.point);
       }
 
-      // Tracers on a minority of rounds — every round leaves a laser show.
-      if (this.rng.chance(def.pellets > 1 ? 0.25 : 0.34)) {
-        _end.copy(_origin).addScaledVector(_spread, maxDist);
-        this.effects.tracer(_origin, _end);
+      _end.copy(_origin).addScaledVector(_spread, maxDist);
+      const impact = events[0]?.point ?? worldHit?.point ?? _end;
+      if (def.wonder?.kind === 'plasma') {
+        // The direct hit remains a normal precision hit. The bloom then catches
+        // nearby bodies, but deliberately excludes that first target so one
+        // projectile never receives an invisible double-damage bonus.
+        this.effects.plasmaBolt(_muzzle, impact);
+        this.effects.plasmaBurst(impact, 1.08);
+        const blastEvents = this.zombies.blast(
+          impact,
+          def.wonder.splashRadius ?? 2.6,
+          this.damage(slot) * (def.wonder.splashDamageMultiplier ?? 0.68),
+          _spread,
+          events[0]?.zombie,
+        );
+        registerEvents(blastEvents);
+      } else if (def.wonder?.kind === 'arc') {
+        if (events[0]) {
+          this.effects.lightningArc(_muzzle, impact);
+          this.effects.electricBurst(impact);
+          const chainEvents = this.zombies.chainLightning(
+            events[0].zombie,
+            def.wonder.chainTargets ?? 4,
+            def.wonder.chainRange ?? 7,
+            this.damage(slot) * (def.wonder.chainDamageMultiplier ?? 0.75),
+          );
+          registerEvents(chainEvents);
+        } else {
+          // A missed arc still visibly grounds itself against the first wall it
+          // reaches, which keeps its feedback honest rather than disappearing.
+          this.effects.lightningArc(_muzzle, impact);
+          this.effects.electricBurst(impact);
+        }
+      } else if (this.rng.chance(def.pellets > 1 ? 0.25 : 0.34)) {
+        // Tracers on a minority of conventional rounds — every round would turn
+        // the scene into a laser show.
+        this.effects.tracer(_muzzle, _end);
+      }
+
+      // One marker per trigger pull, after secondary wonder-weapon damage has
+      // resolved. A chain kill therefore earns a kill marker even if its first
+      // target survived the opening bolt.
+      if (pellet === 0 && hits > beforeHits) {
+        this.onHitmarker?.(kills > beforeKills, headshots > beforeHeadshots);
       }
     }
 
@@ -304,17 +406,15 @@ export class WeaponSystem {
     }
 
     this.viewModel.fire(def, this.shotIndex);
-    this.audio.gunshot(def.audio);
+    if (def.wonder) this.audio.wonderShot(def.wonder.kind);
+    else this.audio.gunshot(def.audio);
 
-    if (def.fireMode === 'pump') {
-      // The pump cycle is what gates the shotgun's rate of fire.
-      this.pumpTimer = 0.42;
-      this.viewModel.ejectShell(def);
-      this.audio.shellDrop();
-    } else {
-      this.viewModel.ejectShell(def);
-      this.audio.shellDrop();
-    }
+    // The pump cycle is what gates the shotgun's rate of fire.
+    if (def.fireMode === 'pump') this.pumpTimer = 0.42;
+    // Shell ejection is visual only. The casing bounce it used to play was a
+    // stack of bare high oscillators, which landed as a scoring chime after
+    // every shot instead of brass on concrete.
+    this.viewModel.ejectShell(def);
   }
 
   private falloff(distance: number, def: WeaponDef): number {
@@ -393,18 +493,68 @@ export class WeaponSystem {
       sprinting: ctx.sprinting,
       inspecting: this.input.isDown('KeyF'),
     });
+
+    this.applyAimZoom(camera);
+  }
+
+  /**
+   * Narrows the world camera toward the weapon's magnification as it comes up.
+   *
+   * Interpolating the half-angle's tangent rather than the FOV in degrees is
+   * what makes the transition feel like one continuous pull instead of racing
+   * at the start and crawling at the end — magnification is a ratio of
+   * tangents, so that is the quantity that should move linearly.
+   *
+   * A weapon with an optic is the exception: the magnification belongs inside
+   * the tube, and pulling the host view in as well would magnify the world
+   * *around* the scope by the same amount, so the player would see a 3x scene
+   * through a 3x scope. The host keeps a slight pull-in only, which is what
+   * shouldering a weapon should feel like.
+   */
+  private applyAimZoom(camera: PerspectiveCamera) {
+    if (this.baseFov === 0) this.baseFov = camera.fov;
+    const zoom = this.viewModel.hasOptic ? OPTIC_HOST_ZOOM : this.active.def.adsZoom ?? 1;
+    const half = (this.baseFov * Math.PI) / 360;
+    const aimed = Math.atan(Math.tan(half) / zoom);
+    const fov = (lerp(half, aimed, this.viewModel.adsBlend) * 360) / Math.PI;
+    if (Math.abs(camera.fov - fov) > 1e-4) {
+      camera.fov = fov;
+      camera.updateProjectionMatrix();
+    }
   }
 
   /** View punch the camera should apply and then decay, in radians. */
   consumeViewPunch(dt: number): { pitch: number; yaw: number } {
-    const pitch = this.viewModel.viewPunchPitch;
-    const yaw = this.viewModel.viewPunchYaw;
+    const pitch = this.viewModel.viewPunchPitch * this.recoilMultiplier;
+    const yaw = this.viewModel.viewPunchYaw * this.recoilMultiplier;
     // The viewmodel decays its own copy; the camera integrates the difference.
+    // Damping only the camera's share is deliberate — Deadshot should steady
+    // the *sight picture*, not stop the weapon itself from kicking, which is
+    // the animation the shot reads from.
     return { pitch: pitch * Math.min(1, dt * 26), yaw: yaw * Math.min(1, dt * 26) };
   }
 
   get aimBlend() {
     return this.viewModel.adsBlend;
+  }
+
+  /**
+   * Vertical field of view the optic's own pass should render at, or 0 when no
+   * off-screen pass is needed — no scope, or the weapon is not up yet. Measured
+   * against the *base* field rather than the live one, so the host view's own
+   * pull-in never compounds into the magnification. Gating on the blend rather
+   * than on the aim input keeps the extra scene render out of hip-fire frames.
+   */
+  get opticFov(): number {
+    if (!this.viewModel.hasOptic || this.viewModel.adsBlend < 0.15 || this.baseFov === 0) return 0;
+    const zoom = Math.max(this.active.def.adsZoom ?? 1, 0.01);
+    const half = Math.atan(Math.tan((this.baseFov * Math.PI) / 360) / zoom);
+    return (half * 360) / Math.PI;
+  }
+
+  /** Hands the optic its rendered sight picture, or `null` to clear it. */
+  setOpticView(texture: Texture | null) {
+    this.viewModel.setOpticView(texture);
   }
 
   /** Crosshair spread in normalised screen units, for the HUD. */

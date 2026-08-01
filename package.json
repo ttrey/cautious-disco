@@ -8,14 +8,20 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "server": "node server/index.mjs",
+    "server:dev": "node server/index.mjs --dev",
+    "host": "npm run build && node server/index.mjs",
+    "host:public": "npm run build && node server/index.mjs --tunnel"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.14.0",
-    "three": "^0.185.0"
+    "three": "^0.185.0",
+    "ws": "^8.21.1"
   },
   "devDependencies": {
     "@types/three": "^0.185.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
   }

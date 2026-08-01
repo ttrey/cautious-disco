@@ -24,9 +24,17 @@ export class NavGrid {
   /** Extra cost per cell — used to bias zombies through windows and doorways. */
   private readonly cost: Float32Array;
   private readonly dist: Float32Array;
-  private readonly queue: Int32Array;
+  /** Reused growable work queue; unlike a ring buffer it cannot alias full and empty. */
+  private readonly queue: number[] = [];
 
-  private lastTargetCell = -1;
+  /**
+   * The seed cells the current field was swept from, as a joined key. A plain
+   * cell index was enough while there was only ever one player; with four it
+   * has to describe the whole set, or the field silently keeps pointing at
+   * wherever the first player was standing when somebody else moved.
+   */
+  private lastTargetKey = '';
+  private readonly seeds: number[] = [];
 
   constructor(
     readonly originX: number,
@@ -41,7 +49,6 @@ export class NavGrid {
     this.blocked = new Uint8Array(n);
     this.cost = new Float32Array(n).fill(1);
     this.dist = new Float32Array(n).fill(UNREACHABLE);
-    this.queue = new Int32Array(n);
   }
 
   private index(cx: number, cz: number) {
@@ -70,7 +77,33 @@ export class NavGrid {
       for (let x = x0; x <= x1; x++) this.blocked[this.index(x, z)] = blocked ? 1 : 0;
     }
     // A geometry change invalidates the field.
-    this.lastTargetCell = -1;
+    this.lastTargetKey = '';
+  }
+
+  /**
+   * Nearest open cell to a blocked one, searched outward. Used when a player is
+   * standing somewhere the grid calls solid — mid-doorway, or on a prop.
+   */
+  private nearestOpen(tx: number, tz: number): number {
+    let best = -1;
+    let bestD = Infinity;
+    for (let r = 1; r <= 4 && best < 0; r++) {
+      for (let dz = -r; dz <= r; dz++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const cx = tx + dx;
+          const cz = tz + dz;
+          if (!this.inBounds(cx, cz)) continue;
+          const i = this.index(cx, cz);
+          if (this.blocked[i]) continue;
+          const d = dx * dx + dz * dz;
+          if (d < bestD) {
+            bestD = d;
+            best = i;
+          }
+        }
+      }
+    }
+    return best;
   }
 
   setCost(minX: number, minZ: number, maxX: number, maxZ: number, value: number) {
@@ -81,7 +114,7 @@ export class NavGrid {
     for (let z = z0; z <= z1; z++) {
       for (let x = x0; x <= x1; x++) this.cost[this.index(x, z)] = value;
     }
-    this.lastTargetCell = -1;
+    this.lastTargetKey = '';
   }
 
   isBlockedWorld(x: number, z: number) {
@@ -92,57 +125,55 @@ export class NavGrid {
   }
 
   /**
-   * Recomputes the distance field toward `target`. Returns false and skips the
-   * work when the target has not left its cell and nothing has changed.
+   * Recomputes the distance field toward one or more targets. Returns false and
+   * skips the work when no target has left its cell and nothing has changed.
+   *
+   * With several targets this is a *multi-source* sweep: every player's cell is
+   * seeded at distance zero in the same pass, so the field that comes out is
+   * the distance to the nearest player, and a zombie descending it walks toward
+   * whichever of the squad is genuinely closest *through the map* rather than
+   * closest as the crow flies. That distinction is the whole reason to do it
+   * this way — a teammate three metres away through a wall is not the one to
+   * chase, and a Euclidean nearest-player test picks them every time.
+   *
+   * It also costs exactly what one sweep costs. The alternative, a field per
+   * player, would be four sweeps and four times the memory to answer a question
+   * this already answers.
    */
-  rebuild(target: Vector3, force = false): boolean {
-    const tx = this.cellX(target.x);
-    const tz = this.cellZ(target.z);
-    if (!this.inBounds(tx, tz)) return false;
-    const targetCell = this.index(tx, tz);
-    if (!force && targetCell === this.lastTargetCell) return false;
-    this.lastTargetCell = targetCell;
+  rebuild(target: Vector3 | readonly Vector3[], force = false): boolean {
+    const targets = Array.isArray(target) ? target : [target as Vector3];
+
+    this.seeds.length = 0;
+    for (const t of targets) {
+      const tx = this.cellX(t.x);
+      const tz = this.cellZ(t.z);
+      if (!this.inBounds(tx, tz)) continue;
+      const cell = this.index(tx, tz);
+      const seed = this.blocked[cell] ? this.nearestOpen(tx, tz) : cell;
+      if (seed >= 0 && !this.seeds.includes(seed)) this.seeds.push(seed);
+    }
+    if (this.seeds.length === 0) return false;
+
+    // Sorted so that two players swapping places is not treated as a change.
+    this.seeds.sort((a, b) => a - b);
+    const key = this.seeds.join(',');
+    if (!force && key === this.lastTargetKey) return false;
+    this.lastTargetKey = key;
 
     this.dist.fill(UNREACHABLE);
-
-    // If the player is standing somewhere blocked (mid-doorway, on a prop),
-    // seed from the nearest open cell instead of giving up.
-    let seed = targetCell;
-    if (this.blocked[seed]) {
-      let best = -1;
-      let bestD = Infinity;
-      for (let r = 1; r <= 4 && best < 0; r++) {
-        for (let dz = -r; dz <= r; dz++) {
-          for (let dx = -r; dx <= r; dx++) {
-            const cx = tx + dx;
-            const cz = tz + dz;
-            if (!this.inBounds(cx, cz)) continue;
-            const i = this.index(cx, cz);
-            if (this.blocked[i]) continue;
-            const d = dx * dx + dz * dz;
-            if (d < bestD) {
-              bestD = d;
-              best = i;
-            }
-          }
-        }
-      }
-      if (best < 0) return false;
-      seed = best;
-    }
 
     // Bucket-free Dijkstra: because costs are near-uniform, a simple FIFO sweep
     // with re-relaxation converges in a handful of passes and avoids the
     // allocation churn of a binary heap.
-    this.dist[seed] = 0;
     let head = 0;
-    let tail = 0;
-    this.queue[tail++] = seed;
-    const n = this.queue.length;
+    this.queue.length = 0;
+    for (const seed of this.seeds) {
+      this.dist[seed] = 0;
+      this.queue.push(seed);
+    }
 
-    while (head !== tail) {
+    while (head < this.queue.length) {
       const current = this.queue[head++];
-      if (head === n) head = 0;
       const cx = current % this.cols;
       const cz = (current / this.cols) | 0;
       const base = this.dist[current];
@@ -163,11 +194,7 @@ export class NavGrid {
           const nd = base + step;
           if (nd < this.dist[ni] - 1e-4) {
             this.dist[ni] = nd;
-            this.queue[tail++] = ni;
-            if (tail === n) tail = 0;
-            // Ring buffer overflow would corrupt the sweep; bail out rather
-            // than silently produce a partial field.
-            if (tail === head) return true;
+            this.queue.push(ni);
           }
         }
       }

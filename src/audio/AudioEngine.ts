@@ -21,6 +21,37 @@ export interface GunAudioSpec {
   crack: number;
   tail: number;
   gain: number;
+  /**
+   * Where the mechanical transient starts, Hz.
+   *
+   * This is the single most identifying part of a gunshot — the hammer, the
+   * bolt and the case mouth, all inside the first fifteen milliseconds. Leaving
+   * it fixed across the roster stamped the same 2.2 kHz tick on every weapon in
+   * the game, and because the ear locks onto a sharp transient far harder than
+   * onto a low body tone, that one shared layer was most of what a player
+   * actually heard. Heavy actions belong an octave or more below light ones.
+   */
+  actionHz: number;
+  /**
+   * Centre of the noise crack at the instant of firing, Hz, and the frequency
+   * it falls to as the report opens out.
+   *
+   * The sweep between them carries the calibre: a subsonic pistol round is a
+   * narrow, quick fall, a rifle cartridge starts far brighter and drops much
+   * further. Both ends were previously constants.
+   */
+  crackHz: number;
+  crackFallHz: number;
+  /** Corner of the low-pass on the body layer, Hz. Bigger bores stay darker. */
+  bodyCutoffHz: number;
+  /**
+   * How much of the body's pitch is left by the end of its fall, 0..1.
+   *
+   * A short, heavy action slams to its floor; a light, high-strung one barely
+   * moves. Fixing this at a third gave every weapon the same downward "thump"
+   * under its own fundamental.
+   */
+  bodyDrop: number;
 }
 
 export class AudioEngine {
@@ -176,8 +207,16 @@ export class AudioEngine {
   /* --- Sounds --------------------------------------------------------- */
 
   /**
-   * Gunshot. Three layers: a very short click transient, a filtered noise crack
+   * Gunshot. Three layers: a short mechanical transient, a filtered noise crack
    * that carries the calibre, and a pitched body sweep for the low end.
+   *
+   * Every parameter of all three layers comes from the weapon's own spec. That
+   * is the whole point: the layers used to share fixed frequencies — a 2.2 kHz
+   * transient, a 3.4 kHz crack falling to 420 Hz, a 900 Hz corner on the body —
+   * and only `bodyHz` and two envelope times varied. A shared transient and a
+   * shared crack are two thirds of what the ear uses to tell one weapon from
+   * another, so however far apart the fundamentals were set, every gun in the
+   * game arrived wearing the same signature on top.
    */
   gunshot(spec: GunAudioSpec, position?: Vector3) {
     if (!this.ctx) return;
@@ -186,28 +225,53 @@ export class AudioEngine {
     const out = this.out(position, 6, 70) as GainNode;
     out.gain.value = spec.gain;
 
-    // Layer 1: transient click.
+    // Layer 1: the action — hammer fall, bolt, case mouth.
     const click = ctx.createOscillator();
     click.type = 'square';
-    click.frequency.setValueAtTime(2200 * this.rng.range(0.9, 1.1), t);
-    click.frequency.exponentialRampToValueAtTime(320, t + 0.014);
+    const action = spec.actionHz * this.rng.range(0.9, 1.1);
+    click.frequency.setValueAtTime(action, t);
+    // The transient's own decay tracks its pitch: a heavy action rings down
+    // slower as well as lower, and holding the ramp time fixed re-introduces a
+    // shared rhythm underneath the pitch differences.
+    const clickFall = 0.010 + 6.5 / spec.actionHz;
+    click.frequency.exponentialRampToValueAtTime(action * 0.14, t + clickFall);
     const clickGain = ctx.createGain();
-    clickGain.gain.setValueAtTime(0.5, t);
-    clickGain.gain.exponentialRampToValueAtTime(0.001, t + 0.02);
-    click.connect(clickGain).connect(out);
+    clickGain.gain.setValueAtTime(0.62, t);
+    clickGain.gain.exponentialRampToValueAtTime(0.001, t + clickFall * 1.5);
+    // A square wave carries harmonics far above its fundamental, so a 600 Hz
+    // action and a 3 kHz one still arrive at the ear with much the same
+    // brightness — the pitch moves but the character does not. Rolling the
+    // transient off in proportion to its own pitch is what turns a heavy bolt
+    // into a dull clack and leaves a light slide crisp.
+    const clickTone = ctx.createBiquadFilter();
+    clickTone.type = 'lowpass';
+    clickTone.frequency.value = action * 3.2;
+    clickTone.Q.value = 0.9;
+    click.connect(clickTone).connect(clickGain).connect(out);
     click.start(t);
-    click.stop(t + 0.03);
+    click.stop(t + clickFall * 2.2);
 
     // Layer 2: the crack — bandpassed noise with a fast downward sweep.
     const noise = this.noiseSource(spec.tail + 0.2, this.rng.range(0.92, 1.1));
     const bp = ctx.createBiquadFilter();
     bp.type = 'bandpass';
-    bp.Q.value = 0.7;
-    bp.frequency.setValueAtTime(3400 * this.rng.range(0.9, 1.15), t);
-    bp.frequency.exponentialRampToValueAtTime(420, t + spec.crack * 3);
+    // Tight enough that `crackHz` actually decides the colour of the report. At
+    // the old Q of 0.7 the passband spanned most of the audible range, so white
+    // noise came out the far side still sounding like white noise and the
+    // per-weapon centre frequency barely registered.
+    bp.Q.value = 1.25;
+    bp.frequency.setValueAtTime(spec.crackHz * this.rng.range(0.9, 1.15), t);
+    bp.frequency.exponentialRampToValueAtTime(spec.crackFallHz, t + spec.crack * 3);
     const noiseGain = ctx.createGain();
-    noiseGain.gain.setValueAtTime(0.9, t);
-    noiseGain.gain.exponentialRampToValueAtTime(0.16, t + spec.crack);
+    // The blast takes a couple of milliseconds to develop, and a bigger bore
+    // takes longer. Starting it flat on the same sample as the action buried
+    // the transient under broadband noise, which is exactly the layer that was
+    // supposed to tell the weapons apart — with the lead in, the first thing
+    // the ear gets is the action's own pitch.
+    const attack = 0.0008 + spec.crack * 0.02;
+    noiseGain.gain.setValueAtTime(0.0001, t);
+    noiseGain.gain.exponentialRampToValueAtTime(0.9, t + attack);
+    noiseGain.gain.exponentialRampToValueAtTime(0.16, t + attack + spec.crack);
     noiseGain.gain.exponentialRampToValueAtTime(0.0008, t + spec.tail);
     noise.connect(bp).connect(noiseGain).connect(out);
     noise.stop(t + spec.tail + 0.1);
@@ -216,16 +280,64 @@ export class AudioEngine {
     const body = ctx.createOscillator();
     body.type = 'triangle';
     body.frequency.setValueAtTime(spec.bodyHz * this.rng.range(0.94, 1.06), t);
-    body.frequency.exponentialRampToValueAtTime(spec.bodyHz * 0.32, t + 0.16);
+    // Longer-tailed weapons carry their body longer; the fall and the release
+    // are both scaled off it rather than pinned at 0.16 / 0.22 s.
+    const bodyFall = 0.10 + spec.tail * 0.14;
+    body.frequency.exponentialRampToValueAtTime(spec.bodyHz * spec.bodyDrop, t + bodyFall);
     const bodyGain = ctx.createGain();
     bodyGain.gain.setValueAtTime(0.85, t);
-    bodyGain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+    bodyGain.gain.exponentialRampToValueAtTime(0.001, t + bodyFall * 1.4);
     const lp = ctx.createBiquadFilter();
     lp.type = 'lowpass';
-    lp.frequency.value = 900;
+    lp.frequency.value = spec.bodyCutoffHz;
     body.connect(bodyGain).connect(lp).connect(out);
     body.start(t);
+    body.stop(t + bodyFall * 1.8);
+  }
+
+  /**
+   * Energy-weapon reports deliberately avoid the brass-and-propellant shape of
+   * `gunshot`: plasma has a pressurised downward sweep, while the coil rifle
+   * has a sharp electrical crack followed by a short unstable hum.
+   */
+  wonderShot(kind: 'plasma' | 'arc') {
+    if (!this.ctx) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const out = this.out() as GainNode;
+    out.gain.value = kind === 'plasma' ? 0.72 : 0.66;
+
+    const body = ctx.createOscillator();
+    body.type = kind === 'plasma' ? 'sawtooth' : 'square';
+    const start = kind === 'plasma' ? 286 : 126;
+    const end = kind === 'plasma' ? 72 : 520;
+    body.frequency.setValueAtTime(start * this.rng.range(0.94, 1.06), t);
+    if (kind === 'plasma') body.frequency.exponentialRampToValueAtTime(end, t + 0.18);
+    else {
+      body.frequency.exponentialRampToValueAtTime(690, t + 0.022);
+      body.frequency.exponentialRampToValueAtTime(end, t + 0.16);
+    }
+    const bodyGain = ctx.createGain();
+    bodyGain.gain.setValueAtTime(kind === 'plasma' ? 0.58 : 0.44, t);
+    bodyGain.gain.exponentialRampToValueAtTime(0.001, t + (kind === 'plasma' ? 0.24 : 0.19));
+    const bodyFilter = ctx.createBiquadFilter();
+    bodyFilter.type = 'lowpass';
+    bodyFilter.frequency.value = kind === 'plasma' ? 1450 : 2150;
+    body.connect(bodyFilter).connect(bodyGain).connect(out);
+    body.start(t);
     body.stop(t + 0.28);
+
+    const noise = this.noiseSource(kind === 'plasma' ? 0.22 : 0.16, kind === 'plasma' ? 0.72 : 1.55);
+    const filter = ctx.createBiquadFilter();
+    filter.type = kind === 'plasma' ? 'bandpass' : 'highpass';
+    filter.Q.value = kind === 'plasma' ? 1.2 : 0.7;
+    filter.frequency.setValueAtTime(kind === 'plasma' ? 820 : 1850, t);
+    filter.frequency.exponentialRampToValueAtTime(kind === 'plasma' ? 190 : 480, t + 0.16);
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(kind === 'plasma' ? 0.32 : 0.48, t);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    noise.connect(filter).connect(noiseGain).connect(out);
+    noise.stop(t + 0.24);
   }
 
   dryFire() {
@@ -265,27 +377,6 @@ export class AudioEngine {
     g.gain.exponentialRampToValueAtTime(0.001, t + sharpness * 4);
     noise.connect(bp).connect(g).connect(out);
     noise.stop(t + 0.16);
-  }
-
-  /** Shell casing bouncing on concrete. */
-  shellDrop(position?: Vector3) {
-    if (!this.ctx) return;
-    const ctx = this.ctx;
-    const base = ctx.currentTime + this.rng.range(0.24, 0.42);
-    const out = this.out(position, 3, 16) as GainNode;
-    out.gain.value = 0.16;
-    for (let i = 0; i < 3; i++) {
-      const t = base + i * this.rng.range(0.05, 0.11);
-      const osc = ctx.createOscillator();
-      osc.type = 'triangle';
-      osc.frequency.value = this.rng.range(2600, 4600);
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0.5 / (i + 1), t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
-      osc.connect(g).connect(out);
-      osc.start(t);
-      osc.stop(t + 0.1);
-    }
   }
 
   /**
@@ -383,20 +474,8 @@ export class AudioEngine {
     g.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
     noise.connect(hp).connect(g).connect(out);
     noise.stop(t + 0.2);
-
-    // Occasional whine as the fragment departs.
-    if (this.rng.chance(0.35)) {
-      const osc = ctx.createOscillator();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(this.rng.range(1800, 3200), t);
-      osc.frequency.exponentialRampToValueAtTime(this.rng.range(500, 900), t + 0.3);
-      const og = ctx.createGain();
-      og.gain.setValueAtTime(0.18, t);
-      og.gain.exponentialRampToValueAtTime(0.001, t + 0.32);
-      osc.connect(og).connect(out);
-      osc.start(t);
-      osc.stop(t + 0.34);
-    }
+    // Deliberately noise only: a bare high sine tail here reads as a scoring
+    // chime rather than a fragment, so impacts stay purely percussive.
   }
 
   footstep(running: boolean) {

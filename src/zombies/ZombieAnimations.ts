@@ -9,6 +9,7 @@ import {
   Object3D,
   Quaternion,
   QuaternionKeyframeTrack,
+  Vector3,
   VectorKeyframeTrack,
 } from 'three';
 import { BoneName, ZombieRig } from './ZombieMesh';
@@ -27,6 +28,25 @@ import { Rng } from '../util/math';
  * pose is a neutral A-stance, so every clip starts by applying POSTURE — the
  * hunched, head-lolled, arms-forward stance that reads as "not alive" even
  * before anything moves.
+ *
+ * SIGN CONVENTION. The model faces -Z, and the two bone families point in
+ * opposite directions, so "forward" is a different sign for each. Getting this
+ * backwards is what buries the arms in the ribcage, so it is spelled out:
+ *
+ *   Spine chain (hips, spine, chest, neck, head) rests pointing +Y:
+ *     x < 0  tips the top forward (-Z)      — a hunch
+ *     z > 0  leans the top to the model's left (+X)
+ *
+ *   Limb bones (upperArm, lowerArm, hand, upLeg, lowLeg) rest pointing -Y:
+ *     x > 0  swings the far end forward (-Z) — a reach, or a leg's front step
+ *     z > 0  swings a LEFT limb away from the body; a RIGHT limb needs z < 0
+ *
+ *   Clavicles rest pointing +X (left) / -X (right):
+ *     clavicleL [_, +y, -z] and clavicleR [_, -y, +z] roll the shoulder
+ *     forward and drop it — the slumped shoulder line of a corpse.
+ *
+ * Because a clavicle's z rotation also tilts the arm's frame, an upper arm has
+ * to out-abduct its clavicle's droop before it clears the ribs at all.
  */
 
 type Pose = Partial<Record<BoneName, [number, number, number]>>;
@@ -47,19 +67,25 @@ interface ClipSpec {
 
 /** The stance every clip is built on top of. */
 const POSTURE: Pose = {
-  hips: [0.06, 0, 0],
-  spine: [0.14, 0, 0.02],
-  chest: [0.12, 0, -0.03],
-  neck: [-0.1, 0, 0.06],
-  head: [0.18, 0.1, -0.12],
-  clavicleL: [0, 0, -0.24],
-  clavicleR: [0, 0, 0.24],
-  upperArmL: [-0.6, 0, -0.34],
-  upperArmR: [-0.55, 0, 0.3],
-  lowerArmL: [-0.85, 0, 0],
-  lowerArmR: [-0.95, 0, 0],
-  handL: [-0.3, 0, 0.2],
-  handR: [-0.3, 0, -0.2],
+  hips: [0, 0, 0],
+  spine: [-0.13, 0, 0.02],
+  chest: [-0.14, 0, -0.03],
+  // The neck and head give back a little of the thoracic hunch, or the chin
+  // ends up buried in the sternum and the face never reads.
+  neck: [0.06, 0, 0.06],
+  head: [0.06, 0.1, -0.12],
+  clavicleL: [0, 0.12, -0.1],
+  clavicleR: [0, -0.12, 0.1],
+  // Abduction has to beat the clavicle droop (0.1) with enough left over to
+  // carry the upper arm clear of a ribcage that is 0.152 m wide at the chest.
+  upperArmL: [0.52, 0, 0.22],
+  upperArmR: [0.46, 0, -0.2],
+  lowerArmL: [0.6, 0, 0],
+  lowerArmR: [0.66, 0, 0],
+  // Wrists extend, so the hands dangle off the ends of forward-held forearms
+  // rather than continuing the reach like a mannequin's.
+  handL: [-0.3, 0, 0.18],
+  handR: [-0.3, 0, -0.18],
   upLegL: [0.04, 0, 0.03],
   upLegR: [0.04, 0, -0.03],
   lowLegL: [-0.14, 0, 0],
@@ -89,8 +115,14 @@ function poseAt(spec: ClipSpec, bone: BoneName, index: number): [number, number,
  * Compiles a spec into an AnimationClip. Every bone gets a track (falling back
  * to the posture pose) so that cross-fading between two clips never leaves a
  * limb stuck at whatever the previous clip left it at.
+ *
+ * `hipsBind` is the rig's bind-pose hips position. Keyframed hips offsets are
+ * authored relative to the bind pose, but a position track is absolute — the
+ * bind position has to be added in here or the pelvis snaps to the rig origin
+ * and the whole body sinks into the floor the moment a clip with a hips track
+ * takes over.
  */
-function buildClip(spec: ClipSpec): AnimationClip {
+function buildClip(spec: ClipSpec, hipsBind: Vector3): AnimationClip {
   const times = spec.keys.map((k) => k.t);
   const tracks: (QuaternionKeyframeTrack | VectorKeyframeTrack)[] = [];
 
@@ -121,7 +153,7 @@ function buildClip(spec: ClipSpec): AnimationClip {
     const values: number[] = [];
     for (const key of spec.keys) {
       const [x, y, z] = key.hips ?? [0, 0, 0];
-      values.push(x, y, z);
+      values.push(hipsBind.x + x, hipsBind.y + y, hipsBind.z + z);
     }
     const track = new VectorKeyframeTrack('hips.position', times, values);
     track.setInterpolation(InterpolateSmooth);
@@ -151,9 +183,10 @@ const WALK: ClipSpec = {
       pose: {
         upLegL: [0.42, 0, 0.03], lowLegL: [-0.3, 0, 0], footL: [0.05, 0, 0],
         upLegR: [-0.3, 0, -0.03], lowLegR: [-0.12, 0, 0], footR: [0.24, 0, 0],
-        spine: [0.16, 0.06, 0.02], chest: [0.12, -0.07, -0.03],
-        upperArmL: [-0.5, 0, -0.36], upperArmR: [-0.68, 0, 0.28],
-        head: [0.2, 0.14, -0.14],
+        spine: [-0.16, 0.06, 0.02], chest: [-0.12, -0.07, -0.03],
+        // Left leg leads, so the right arm leads with it.
+        upperArmL: [0.36, 0, 0.24], upperArmR: [0.62, 0, -0.18],
+        head: [0.04, 0.14, -0.14],
       },
     },
     {
@@ -162,9 +195,9 @@ const WALK: ClipSpec = {
       pose: {
         upLegL: [0.06, 0, 0.03], lowLegL: [-0.5, 0, 0], footL: [0.16, 0, 0],
         upLegR: [0.06, 0, -0.03], lowLegR: [-0.16, 0, 0], footR: [0.1, 0, 0],
-        spine: [0.2, 0, 0.05], chest: [0.14, 0, -0.02],
-        upperArmL: [-0.58, 0, -0.34], upperArmR: [-0.6, 0, 0.3],
-        head: [0.24, 0.04, -0.06],
+        spine: [-0.2, 0, 0.05], chest: [-0.14, 0, -0.02],
+        upperArmL: [0.5, 0, 0.22], upperArmR: [0.5, 0, -0.2],
+        head: [0.0, 0.04, -0.06],
       },
     },
     {
@@ -174,9 +207,9 @@ const WALK: ClipSpec = {
         // The dragging leg: it never fully lifts.
         upLegL: [-0.26, 0, 0.03], lowLegL: [-0.1, 0, 0], footL: [0.26, 0, 0],
         upLegR: [0.36, 0, -0.03], lowLegR: [-0.34, 0, 0], footR: [0.04, 0, 0],
-        spine: [0.16, -0.06, 0.02], chest: [0.12, 0.07, -0.04],
-        upperArmL: [-0.66, 0, -0.3], upperArmR: [-0.48, 0, 0.34],
-        head: [0.16, -0.08, -0.16],
+        spine: [-0.16, -0.06, 0.02], chest: [-0.12, 0.07, -0.04],
+        upperArmL: [0.64, 0, 0.2], upperArmR: [0.38, 0, -0.24],
+        head: [0.08, -0.08, -0.16],
       },
     },
     {
@@ -185,9 +218,9 @@ const WALK: ClipSpec = {
       pose: {
         upLegL: [0.04, 0, 0.03], lowLegL: [-0.2, 0, 0], footL: [0.12, 0, 0],
         upLegR: [0.04, 0, -0.03], lowLegR: [-0.42, 0, 0], footR: [0.14, 0, 0],
-        spine: [0.2, 0, 0.03], chest: [0.14, 0, -0.03],
-        upperArmL: [-0.56, 0, -0.34], upperArmR: [-0.58, 0, 0.3],
-        head: [0.22, 0.02, -0.1],
+        spine: [-0.2, 0, 0.03], chest: [-0.14, 0, -0.03],
+        upperArmL: [0.52, 0, 0.22], upperArmR: [0.48, 0, -0.2],
+        head: [0.02, 0.02, -0.1],
       },
     },
     {
@@ -196,15 +229,22 @@ const WALK: ClipSpec = {
       pose: {
         upLegL: [0.42, 0, 0.03], lowLegL: [-0.3, 0, 0], footL: [0.05, 0, 0],
         upLegR: [-0.3, 0, -0.03], lowLegR: [-0.12, 0, 0], footR: [0.24, 0, 0],
-        spine: [0.16, 0.06, 0.02], chest: [0.12, -0.07, -0.03],
-        upperArmL: [-0.5, 0, -0.36], upperArmR: [-0.68, 0, 0.28],
-        head: [0.2, 0.14, -0.14],
+        spine: [-0.16, 0.06, 0.02], chest: [-0.12, -0.07, -0.03],
+        upperArmL: [0.36, 0, 0.24], upperArmR: [0.62, 0, -0.18],
+        head: [0.04, 0.14, -0.14],
       },
     },
   ],
 };
 
-/** Sprint: longer stride, deeper forward lean, arms thrown out ahead. */
+/**
+ * Sprint: longer stride, deeper forward lean, arms thrown out ahead.
+ *
+ * The pelvis stays level and the stride angles are absolute. Carrying the lean
+ * on `hips` instead would rotate the legs with it, so every leg key would have
+ * to be read as an offset from the torso — and the clip drifts out of step with
+ * the walk, whose pelvis is level, the moment either one is retuned.
+ */
 const RUN: ClipSpec = {
   name: 'run',
   duration: 0.72,
@@ -214,60 +254,60 @@ const RUN: ClipSpec = {
       t: 0,
       hips: [0, 0.02, 0],
       pose: {
-        hips: [0.16, 0, 0], spine: [0.24, 0.08, 0], chest: [0.16, -0.08, 0],
-        upLegL: [0.78, 0, 0.04], lowLegL: [-0.6, 0, 0], footL: [0.1, 0, 0],
-        upLegR: [-0.52, 0, -0.04], lowLegR: [-0.5, 0, 0], footR: [0.3, 0, 0],
-        upperArmL: [-1.15, 0, -0.4], lowerArmL: [-1.0, 0, 0],
-        upperArmR: [-0.85, 0, 0.34], lowerArmR: [-1.3, 0, 0],
-        head: [0.1, 0.1, -0.08], neck: [-0.22, 0, 0.04],
+        spine: [-0.3, 0.08, 0], chest: [-0.24, -0.08, 0],
+        upLegL: [0.94, 0, 0.04], lowLegL: [-0.6, 0, 0], footL: [0.1, 0, 0],
+        upLegR: [-0.36, 0, -0.04], lowLegR: [-0.5, 0, 0], footR: [0.3, 0, 0],
+        upperArmL: [1.2, 0, 0.26], lowerArmL: [0.3, 0, 0],
+        upperArmR: [0.95, 0, -0.22], lowerArmR: [0.5, 0, 0],
+        head: [0.2, 0.1, -0.08], neck: [0.22, 0, 0.04],
       },
     },
     {
       t: 0.18,
       hips: [0, -0.06, 0],
       pose: {
-        hips: [0.18, 0, 0], spine: [0.28, 0, 0], chest: [0.18, 0, 0],
-        upLegL: [0.1, 0, 0.04], lowLegL: [-0.9, 0, 0], footL: [0.2, 0, 0],
-        upLegR: [0.06, 0, -0.04], lowLegR: [-0.22, 0, 0], footR: [0.12, 0, 0],
-        upperArmL: [-1.0, 0, -0.38], lowerArmL: [-1.1, 0, 0],
-        upperArmR: [-1.0, 0, 0.36], lowerArmR: [-1.15, 0, 0],
-        head: [0.14, 0, -0.04], neck: [-0.24, 0, 0],
+        spine: [-0.34, 0, 0], chest: [-0.26, 0, 0],
+        upLegL: [0.28, 0, 0.04], lowLegL: [-0.9, 0, 0], footL: [0.2, 0, 0],
+        upLegR: [0.24, 0, -0.04], lowLegR: [-0.22, 0, 0], footR: [0.12, 0, 0],
+        upperArmL: [1.05, 0, 0.24], lowerArmL: [0.42, 0, 0],
+        upperArmR: [1.05, 0, -0.24], lowerArmR: [0.42, 0, 0],
+        head: [0.24, 0, -0.04], neck: [0.24, 0, 0],
       },
     },
     {
       t: 0.36,
       hips: [0, 0.02, 0],
       pose: {
-        hips: [0.16, 0, 0], spine: [0.24, -0.08, 0], chest: [0.16, 0.08, 0],
-        upLegL: [-0.52, 0, 0.04], lowLegL: [-0.5, 0, 0], footL: [0.3, 0, 0],
-        upLegR: [0.78, 0, -0.04], lowLegR: [-0.6, 0, 0], footR: [0.1, 0, 0],
-        upperArmL: [-0.85, 0, -0.34], lowerArmL: [-1.3, 0, 0],
-        upperArmR: [-1.15, 0, 0.4], lowerArmR: [-1.0, 0, 0],
-        head: [0.1, -0.1, -0.08], neck: [-0.22, 0, 0.04],
+        spine: [-0.3, -0.08, 0], chest: [-0.24, 0.08, 0],
+        upLegL: [-0.36, 0, 0.04], lowLegL: [-0.5, 0, 0], footL: [0.3, 0, 0],
+        upLegR: [0.94, 0, -0.04], lowLegR: [-0.6, 0, 0], footR: [0.1, 0, 0],
+        upperArmL: [0.95, 0, 0.2], lowerArmL: [0.5, 0, 0],
+        upperArmR: [1.2, 0, -0.28], lowerArmR: [0.3, 0, 0],
+        head: [0.2, -0.1, -0.08], neck: [0.22, 0, 0.04],
       },
     },
     {
       t: 0.54,
       hips: [0, -0.06, 0],
       pose: {
-        hips: [0.18, 0, 0], spine: [0.28, 0, 0], chest: [0.18, 0, 0],
-        upLegL: [0.06, 0, 0.04], lowLegL: [-0.22, 0, 0], footL: [0.12, 0, 0],
-        upLegR: [0.1, 0, -0.04], lowLegR: [-0.9, 0, 0], footR: [0.2, 0, 0],
-        upperArmL: [-1.0, 0, -0.38], lowerArmL: [-1.1, 0, 0],
-        upperArmR: [-1.0, 0, 0.36], lowerArmR: [-1.15, 0, 0],
-        head: [0.14, 0, -0.04], neck: [-0.24, 0, 0],
+        spine: [-0.34, 0, 0], chest: [-0.26, 0, 0],
+        upLegL: [0.24, 0, 0.04], lowLegL: [-0.22, 0, 0], footL: [0.12, 0, 0],
+        upLegR: [0.28, 0, -0.04], lowLegR: [-0.9, 0, 0], footR: [0.2, 0, 0],
+        upperArmL: [1.05, 0, 0.24], lowerArmL: [0.42, 0, 0],
+        upperArmR: [1.05, 0, -0.24], lowerArmR: [0.42, 0, 0],
+        head: [0.24, 0, -0.04], neck: [0.24, 0, 0],
       },
     },
     {
       t: 0.72,
       hips: [0, 0.02, 0],
       pose: {
-        hips: [0.16, 0, 0], spine: [0.24, 0.08, 0], chest: [0.16, -0.08, 0],
-        upLegL: [0.78, 0, 0.04], lowLegL: [-0.6, 0, 0], footL: [0.1, 0, 0],
-        upLegR: [-0.52, 0, -0.04], lowLegR: [-0.5, 0, 0], footR: [0.3, 0, 0],
-        upperArmL: [-1.15, 0, -0.4], lowerArmL: [-1.0, 0, 0],
-        upperArmR: [-0.85, 0, 0.34], lowerArmR: [-1.3, 0, 0],
-        head: [0.1, 0.1, -0.08], neck: [-0.22, 0, 0.08],
+        spine: [-0.3, 0.08, 0], chest: [-0.24, -0.08, 0],
+        upLegL: [0.94, 0, 0.04], lowLegL: [-0.6, 0, 0], footL: [0.1, 0, 0],
+        upLegR: [-0.36, 0, -0.04], lowLegR: [-0.5, 0, 0], footR: [0.3, 0, 0],
+        upperArmL: [1.2, 0, 0.26], lowerArmL: [0.3, 0, 0],
+        upperArmR: [0.95, 0, -0.22], lowerArmR: [0.5, 0, 0],
+        head: [0.2, 0.1, -0.08], neck: [0.22, 0, 0.08],
       },
     },
   ],
@@ -279,9 +319,9 @@ const IDLE: ClipSpec = {
   duration: 3.4,
   loop: true,
   keys: [
-    { t: 0, pose: { spine: [0.14, 0.04, 0.02], head: [0.2, 0.12, -0.14], upperArmL: [-0.56, 0, -0.32] } },
-    { t: 1.7, pose: { spine: [0.17, -0.04, 0.04], head: [0.14, -0.1, -0.08], upperArmL: [-0.62, 0, -0.36] } },
-    { t: 3.4, pose: { spine: [0.14, 0.04, 0.02], head: [0.2, 0.12, -0.14], upperArmL: [-0.56, 0, -0.32] } },
+    { t: 0, pose: { spine: [-0.13, 0.04, 0.02], head: [0.08, 0.12, -0.14], upperArmL: [0.48, 0, 0.23] } },
+    { t: 1.7, pose: { spine: [-0.17, -0.04, 0.04], head: [0.02, -0.1, -0.08], upperArmL: [0.56, 0, 0.2] } },
+    { t: 3.4, pose: { spine: [-0.13, 0.04, 0.02], head: [0.08, 0.12, -0.14], upperArmL: [0.48, 0, 0.23] } },
   ],
 };
 
@@ -294,38 +334,41 @@ const ATTACK: ClipSpec = {
     {
       t: 0,
       pose: {
-        spine: [0.14, 0, 0.02],
-        upperArmL: [-0.6, 0, -0.34], upperArmR: [-0.55, 0, 0.3],
-        lowerArmL: [-0.85, 0, 0], lowerArmR: [-0.95, 0, 0],
+        spine: [-0.13, 0, 0.02],
+        upperArmL: [0.52, 0, 0.22], upperArmR: [0.46, 0, -0.2],
+        lowerArmL: [0.6, 0, 0], lowerArmR: [0.66, 0, 0],
       },
     },
     {
-      // Wind up: torso twists back, arms raise.
+      // Wind up: torso twists and straightens, arms rise up and behind the
+      // head. An upper arm past -PI/2 is above the shoulder and *behind* it,
+      // which is what makes the strike slerp forward over the top rather than
+      // taking the short way down through the hips.
       t: 0.34,
       pose: {
-        spine: [-0.1, -0.24, 0.02], chest: [-0.06, -0.2, 0], neck: [0.1, 0.2, 0],
-        upperArmL: [-2.1, 0.2, -0.7], upperArmR: [-2.0, -0.2, 0.6],
-        lowerArmL: [-0.5, 0, 0], lowerArmR: [-0.55, 0, 0],
-        head: [-0.1, 0.16, -0.06],
+        spine: [0.06, -0.24, 0.02], chest: [0.04, -0.2, 0], neck: [-0.1, 0.2, 0],
+        upperArmL: [-2.5, 0.2, 0.7], upperArmR: [-2.4, -0.2, -0.6],
+        lowerArmL: [0.6, 0, 0], lowerArmR: [0.65, 0, 0],
+        head: [-0.02, 0.16, -0.06],
       },
     },
     {
-      // Strike.
+      // Strike: everything comes down and forward at once.
       t: 0.5,
       pose: {
-        spine: [0.34, 0.2, 0.02], chest: [0.22, 0.18, 0], neck: [-0.2, -0.14, 0],
-        upperArmL: [-0.2, -0.3, -0.2], upperArmR: [-0.15, 0.3, 0.16],
-        lowerArmL: [-0.3, 0, 0], lowerArmR: [-0.35, 0, 0],
-        handL: [-0.7, 0, 0.3], handR: [-0.7, 0, -0.3],
-        head: [0.3, -0.06, -0.1],
+        spine: [-0.34, 0.2, 0.02], chest: [-0.22, 0.18, 0], neck: [0.2, -0.14, 0],
+        upperArmL: [1.05, -0.3, 0.24], upperArmR: [0.95, 0.3, -0.22],
+        lowerArmL: [0.45, 0, 0], lowerArmR: [0.5, 0, 0],
+        handL: [0.5, 0, 0.3], handR: [0.5, 0, -0.3],
+        head: [0.14, -0.06, -0.1],
       },
     },
     {
       t: 0.95,
       pose: {
-        spine: [0.14, 0, 0.02],
-        upperArmL: [-0.6, 0, -0.34], upperArmR: [-0.55, 0, 0.3],
-        lowerArmL: [-0.85, 0, 0], lowerArmR: [-0.95, 0, 0],
+        spine: [-0.13, 0, 0.02],
+        upperArmL: [0.52, 0, 0.22], upperArmR: [0.46, 0, -0.2],
+        lowerArmL: [0.6, 0, 0], lowerArmR: [0.66, 0, 0],
       },
     },
   ],
@@ -339,38 +382,50 @@ const DEATH: ClipSpec = {
   keys: [
     { t: 0, hips: [0, 0, 0], pose: {} },
     {
+      // Knees buckle, torso folds over them.
       t: 0.26,
       hips: [0, -0.16, 0.04],
       pose: {
-        spine: [0.42, 0.1, 0], chest: [0.3, 0.08, 0], neck: [0.2, 0, 0], head: [0.4, 0.1, -0.1],
+        spine: [-0.42, 0.1, 0], chest: [-0.3, 0.08, 0], neck: [-0.1, 0, 0], head: [-0.1, 0.1, -0.1],
         upLegL: [0.6, 0, 0.1], lowLegL: [-1.1, 0, 0],
         upLegR: [0.5, 0, -0.1], lowLegR: [-1.3, 0, 0],
-        upperArmL: [-0.2, 0, -0.5], upperArmR: [-0.15, 0, 0.45],
-        lowerArmL: [-0.3, 0, 0], lowerArmR: [-0.3, 0, 0],
+        upperArmL: [0.25, 0, 0.55], upperArmR: [0.2, 0, -0.5],
+        lowerArmL: [0.3, 0, 0], lowerArmR: [0.3, 0, 0],
       },
     },
     {
+      // Pitching forward onto the face. Arm angles are chosen against the *sum*
+      // of the chain above them — a pelvis rotated -1.0 and a spine rotated
+      // -0.5 already point the shoulder at the ground, so an upper arm needs
+      // roughly +1.6 just to hang vertically.
       t: 0.66,
       hips: [0, -0.62, 0.16],
       pose: {
-        hips: [1.0, 0.12, 0],
-        spine: [0.5, 0.16, 0.1], chest: [0.34, 0.1, 0.08], neck: [0.3, 0, 0], head: [0.5, 0.2, -0.2],
-        upLegL: [1.5, 0, 0.2], lowLegL: [-1.7, 0, 0],
-        upLegR: [1.2, 0, -0.2], lowLegR: [-1.9, 0, 0],
-        upperArmL: [0.4, 0, -0.7], upperArmR: [0.5, 0, 0.6],
-        lowerArmL: [-0.2, 0, 0], lowerArmR: [-0.2, 0, 0],
+        hips: [-1.0, 0.12, 0],
+        spine: [-0.5, 0.12, 0.05], chest: [-0.24, 0.08, 0.04], neck: [-0.1, 0, 0], head: [0.3, 0.2, -0.2],
+        upLegL: [-0.1, 0, 0.16], lowLegL: [-0.35, 0, 0],
+        upLegR: [-0.16, 0, -0.14], lowLegR: [-0.3, 0, 0],
+        upperArmL: [0.74, 0, 0.55], upperArmR: [0.7, 0, -0.5],
+        lowerArmL: [0.3, 0, 0], lowerArmR: [0.3, 0, 0],
       },
     },
     {
+      // Settled: flat on the front, legs trailing, arms splayed on the floor.
       t: 1.15,
       hips: [0, -0.86, 0.24],
       pose: {
-        hips: [1.5, 0.16, 0.06],
-        spine: [0.3, 0.2, 0.14], chest: [0.16, 0.12, 0.1], neck: [0.36, 0, 0], head: [0.2, 0.34, -0.3],
-        upLegL: [1.7, 0, 0.34], lowLegL: [-1.5, 0, 0],
-        upLegR: [1.4, 0, -0.3], lowLegR: [-1.8, 0, 0],
-        upperArmL: [0.9, 0, -1.0], upperArmR: [1.0, 0, 0.9],
-        lowerArmL: [-0.1, 0, 0], lowerArmR: [-0.1, 0, 0],
+        // Keep the twist and side-bend small. A prone body rolled by 0.3 puts
+        // one shoulder in the air and drives the other hand through the floor.
+        hips: [-1.35, 0.05, 0.02],
+        spine: [-0.16, 0.06, 0.05], chest: [-0.06, 0.04, 0.04], neck: [-0.18, 0, 0], head: [0.24, 0.34, -0.3],
+        // Limb angles here are absolute-ish: with the pelvis rotated -1.35, a
+        // limb needs its own rotation near -1.5 total to lie flat, and anything
+        // past that lifts it off the floor again.
+        upLegL: [-0.08, 0, 0.18], lowLegL: [-0.12, 0, 0],
+        upLegR: [-0.14, 0, -0.16], lowLegR: [-0.06, 0, 0],
+        upperArmL: [-0.05, 0, 1.0], upperArmR: [-0.09, 0, -0.95],
+        lowerArmL: [0.15, 0, 0], lowerArmR: [0.12, 0, 0],
+        handL: [0, 0, 0.2], handR: [0, 0, -0.2],
       },
     },
   ],
@@ -386,9 +441,11 @@ const FLINCH: ClipSpec = {
     {
       t: 0.1,
       pose: {
-        spine: [-0.08, 0.1, 0.02], chest: [-0.12, 0.12, -0.03], neck: [-0.3, 0, 0.06],
-        head: [-0.2, 0.16, -0.12],
-        upperArmL: [-0.35, 0, -0.5], upperArmR: [-0.3, 0, 0.46],
+        // A hit knocks the hunch out of them: the spine straightens and the
+        // head snaps back before the posture reasserts itself.
+        spine: [0.08, 0.1, 0.02], chest: [0.12, 0.12, -0.03], neck: [0.3, 0, 0.06],
+        head: [0.2, 0.16, -0.12],
+        upperArmL: [0.3, 0, 0.42], upperArmR: [0.26, 0, -0.4],
       },
     },
     { t: 0.34, pose: {} },
@@ -397,15 +454,23 @@ const FLINCH: ClipSpec = {
 
 const SPECS = [WALK, RUN, IDLE, ATTACK, DEATH, FLINCH];
 
-let cachedClips: Record<string, AnimationClip> | null = null;
+const cachedClips = new Map<string, Record<string, AnimationClip>>();
 
-/** Clips are pose data, not per-instance state, so one set serves every zombie. */
-export function zombieClips(): Record<string, AnimationClip> {
-  if (!cachedClips) {
-    cachedClips = {};
-    for (const spec of SPECS) cachedClips[spec.name] = buildClip(spec);
+/**
+ * Clips are pose data, not per-instance state, so one set serves every zombie
+ * of a given stature. Only the hips track depends on the rig — variants differ
+ * by a height scale — so the cache is keyed on the bind hips position and there
+ * is one set per distinct variant height, not one per zombie.
+ */
+export function zombieClips(hipsBind: Vector3): Record<string, AnimationClip> {
+  const key = `${hipsBind.x.toFixed(4)},${hipsBind.y.toFixed(4)},${hipsBind.z.toFixed(4)}`;
+  let clips = cachedClips.get(key);
+  if (!clips) {
+    clips = {};
+    for (const spec of SPECS) clips[spec.name] = buildClip(spec, hipsBind);
+    cachedClips.set(key, clips);
   }
-  return cachedClips;
+  return clips;
 }
 
 export type ZombieAnimName = 'walk' | 'run' | 'idle' | 'attack' | 'death' | 'flinch';
@@ -425,7 +490,7 @@ export class ZombieAnimator {
 
   constructor(rig: ZombieRig, rng: Rng) {
     this.mixer = new AnimationMixer(rig.root);
-    const clips = zombieClips();
+    const clips = zombieClips(rig.bindPositions.hips);
     this.rate = rng.range(0.86, 1.16);
     this.phase = rng.next();
 

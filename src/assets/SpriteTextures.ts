@@ -269,26 +269,33 @@ export function labelTexture(
 ): Texture {
   const w = opts.width ?? 512;
   const h = opts.height ?? 256;
-  const c = document.createElement('canvas');
-  c.width = w;
-  c.height = h;
-  const ctx = c.getContext('2d')!;
-  ctx.fillStyle = opts.bg ?? 'rgba(0,0,0,0)';
-  ctx.fillRect(0, 0, w, h);
-  ctx.fillStyle = opts.color ?? '#f4e4c1';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
   const size = opts.size ?? Math.floor(h / (lines.length + 1));
-  ctx.font = `${opts.font ?? '700'} ${size}px "Rajdhani", "Oswald", sans-serif`;
-  const step = h / (lines.length + 1);
-  lines.forEach((line, i) => {
-    ctx.fillText(line, w / 2, step * (i + 1), w * 0.92);
+  const color = opts.color ?? '#f4e4c1';
+  const bg = opts.bg ?? 'rgba(0,0,0,0)';
+  const font = opts.font ?? '700';
+  const key = `label:${JSON.stringify([lines, w, h, color, bg, font, size])}`;
+
+  return memo(key, () => {
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d')!;
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `${font} ${size}px "Rajdhani", "Oswald", sans-serif`;
+    const step = h / (lines.length + 1);
+    lines.forEach((line, i) => {
+      ctx.fillText(line, w / 2, step * (i + 1), w * 0.92);
+    });
+    const t = new CanvasTexture(c);
+    t.colorSpace = SRGBColorSpace;
+    t.anisotropy = 4;
+    t.needsUpdate = true;
+    return t;
   });
-  const t = new CanvasTexture(c);
-  t.colorSpace = SRGBColorSpace;
-  t.anisotropy = 4;
-  t.needsUpdate = true;
-  return t;
 }
 
 /** Clamps a 0..1 value into a byte for inline canvas colour strings. */

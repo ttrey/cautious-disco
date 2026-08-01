@@ -125,6 +125,23 @@ export const Presets = {
       clearcoatRoughness: 0.35,
     }),
 
+  /**
+   * Recoil pads, butt plates, grip inserts.
+   *
+   * Deliberately the flattest surface in the library: a rubber pad next to a
+   * parkerised receiver is the one place on a weapon where the specular
+   * response drops to nothing, and that contrast is what stops the whole gun
+   * reading as a single moulded object.
+   */
+  rubber: (tint = 0x1b1b1d) =>
+    makeSurface('polymer', {
+      repeat: 1,
+      tint,
+      roughness: 1,
+      metalness: 0,
+      normalScale: 1.1,
+    }),
+
   brass: () =>
     makeSurface('gunmetal', {
       repeat: 1,

@@ -84,10 +84,16 @@ export function solveTwoBoneIK(
   // then hinges cleanly in the limb plane.
   _bend.normalize();
   const localBend = _bend.clone().applyQuaternion(_q.clone().invert());
-  // Rotating about local +Y by θ shifts a vector's XZ angle by -θ, so rolling
-  // by exactly `roll` brings the bend axis onto +X.
+  // `localBend` is the bend axis measured *in the bone's frame*, at XZ angle α.
+  // `rotateY(θ)` turns the frame, not a vector within it: the bone's own +X
+  // lands at XZ angle -θ, so bringing +X onto the bend axis needs θ = -α.
+  //
+  // Getting this sign backwards still produces a geometrically valid arm — the
+  // triangle closes and the wrist sits at exactly the right *distance* from the
+  // shoulder — but the whole limb is mirrored about the upper bone, which put
+  // both hands roughly 250 mm wide of the grips they were solving for.
   const roll = Math.atan2(localBend.z, localBend.x);
-  root.rotateY(roll);
+  root.rotateY(-roll);
 
   elbow.rotation.set(elbowAngle, 0, 0);
 }

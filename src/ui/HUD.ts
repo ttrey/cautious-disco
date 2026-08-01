@@ -30,6 +30,7 @@ const CSS = `
 #hitmarker .c { width: 2px; height: 12px; left: 14px; top: 0; }
 #hitmarker .d { width: 2px; height: 12px; left: 14px; bottom: 0; }
 #hitmarker.kill i { background: #ff5a4a; }
+#hitmarker.headshot i { background: #ffcf6b; box-shadow: 0 0 8px rgba(255,207,107,.9); }
 
 .corner { position: absolute; padding: 20px 26px; }
 #points { left: 0; bottom: 0; }
@@ -38,6 +39,26 @@ const CSS = `
 #points .label { font-size: 13px; letter-spacing: .34em; opacity: .55; text-transform: uppercase; }
 #points .delta { position: absolute; left: 26px; bottom: 74px; font-size: 22px; font-weight: 700;
   color: #ffe9a8; opacity: 0; transform: translateY(0); }
+
+/* Squad scoreboard, stacked directly above the local points counter in the
+   bottom-left corner so the whole economy — yours and everybody else's — reads
+   as one block rather than two unrelated corners. Hidden entirely in single
+   player, where a one-row list of yourself says nothing the counter below it is
+   not already saying. */
+#squad { position: absolute; left: 0; bottom: 92px; padding: 0 26px; display: none;
+  grid-auto-rows: min-content; gap: 6px; }
+#squad.show { display: grid; }
+#squad .row { display: flex; align-items: center; gap: 11px; min-width: 216px;
+  transition: opacity .25s; }
+#squad .row .pip { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+  box-shadow: 0 0 7px currentColor; background: currentColor; }
+#squad .row .name { flex: 1; font-size: 15px; letter-spacing: .1em; text-transform: uppercase;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .82; }
+#squad .row .score { font-size: 17px; font-weight: 700; color: #ffcf6b;
+  font-variant-numeric: tabular-nums; letter-spacing: .01em; }
+#squad .row.self .name { opacity: 1; color: #fff; }
+#squad .row.down { opacity: .4; }
+#squad .row.down .score { color: #ff6a55; }
 
 #ammo { right: 0; bottom: 0; text-align: right; }
 #ammo .mag { font-size: 46px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
@@ -105,12 +126,62 @@ const CSS = `
 #overlay .keys span { text-align: left; opacity: .72; }
 
 #fps { position: absolute; right: 8px; top: 50%; font-size: 11px; opacity: .3; }
+
+@media (max-width: 560px) {
+  .corner { padding: 12px 14px; }
+  #points .value, #ammo .mag { font-size: 32px; }
+  #points .label, #ammo .name, #ammo .reloading { font-size: 10px; letter-spacing: .16em; }
+  #ammo .reserve { font-size: 18px; }
+  #round .value { font-size: 30px; }
+  #round .label, #round .left { font-size: 10px; letter-spacing: .18em; }
+  #perks { gap: 6px; padding: 12px 14px; }
+  .perk { width: 34px; height: 34px; font-size: 9px; }
+
+  #squad { bottom: 66px; padding: 0 14px; gap: 4px; }
+  #squad .row { min-width: 150px; gap: 8px; }
+  #squad .row .name { font-size: 12px; letter-spacing: .06em; }
+  #squad .row .score { font-size: 13px; }
+
+  #prompt { top: 56%; width: min(92vw, 340px); }
+  #prompt .key { width: 26px; height: 26px; margin-right: 6px; font-size: 13px; }
+  #prompt .text, #prompt .cost { font-size: 15px; letter-spacing: .035em; }
+  #prompt .cost { margin-left: 6px; }
+
+  #banner { top: 29%; width: 92vw; }
+  #banner .big { font-size: clamp(34px, 11vw, 48px); letter-spacing: .08em; }
+  #banner .sub { font-size: 12px; letter-spacing: .20em; }
+
+  #overlay { align-items: center; overflow: auto; padding: 20px 0; }
+  #overlay .panel { width: min(100%, 360px); padding: 24px 20px; }
+  #overlay h1 { font-size: clamp(36px, 12vw, 48px); letter-spacing: .10em; overflow-wrap: anywhere; }
+  #overlay h2 { font-size: 14px; letter-spacing: .18em; margin-bottom: 16px; }
+  #overlay p { font-size: 13px; line-height: 1.55; }
+  #overlay .keys { gap: 5px 12px; margin: 16px 0 4px; font-size: 12px; }
+  #overlay button { font-size: 15px; padding: 12px 30px; }
+  #overlay .stats { gap: 14px; margin: 20px 0 24px; }
+  #overlay .stat { min-width: 72px; }
+  #overlay .stat .v { font-size: 29px; }
+  #overlay .stat .k { font-size: 9px; letter-spacing: .16em; }
+  #fps { display: none; }
+}
 `;
 
 export interface HudStats {
   round: number;
   kills: number;
   points: number;
+}
+
+/** One line of the co-op scoreboard in the bottom-left corner. */
+export interface SquadEntry {
+  id: string;
+  name: string;
+  points: number;
+  /** CSS colour for the status pip — the operator's own accent. */
+  color: string;
+  self: boolean;
+  downed: boolean;
+  alive: boolean;
 }
 
 export class HUD {
@@ -124,6 +195,7 @@ export class HUD {
   private readonly roundValue: HTMLElement;
   private readonly roundLeft: HTMLElement;
   private readonly perkBar: HTMLElement;
+  private readonly squad: HTMLElement;
   private readonly prompt: HTMLElement;
   private readonly promptText: HTMLElement;
   private readonly promptCost: HTMLElement;
@@ -163,6 +235,7 @@ export class HUD {
       <div class="corner" id="round">
         <div class="label">Round</div><div class="value">1</div><div class="left">&nbsp;</div>
       </div>
+      <div id="squad"></div>
       <div class="corner" id="points">
         <div class="delta"></div><div class="value">500</div><div class="label">Points</div>
       </div>
@@ -188,6 +261,7 @@ export class HUD {
     this.roundValue = q('#round .value');
     this.roundLeft = q('#round .left');
     this.perkBar = q('#perks');
+    this.squad = q('#squad');
     this.prompt = q('#prompt');
     this.promptText = q('#prompt .text');
     this.promptCost = q('#prompt .cost');
@@ -206,7 +280,11 @@ export class HUD {
       this.damageArrows.push(arrow);
     }
 
-    this.showStartScreen();
+    // No screen is shown here any more. The front end (`Menu`) decides what the
+    // player sees before a round: single player still gets `showStartScreen`,
+    // but a co-op player goes from the lobby straight into the world, and a HUD
+    // that put its own start screen up in the constructor would flash it behind
+    // the menu on the way past.
   }
 
   /* --- Live readouts --------------------------------------------------- */
@@ -237,6 +315,50 @@ export class HUD {
   setRound(round: number, remaining: number) {
     this.roundValue.textContent = String(round);
     this.roundLeft.textContent = remaining > 0 ? `${remaining} remaining` : 'Clear';
+  }
+
+  /**
+   * The squad list above the points counter.
+   *
+   * Rebuilt wholesale on each call. It is at most four rows and it changes only
+   * when a score does, so the DOM churn is nothing next to the alternative —
+   * diffing rows by id and keeping them in sync — and it cannot drift out of
+   * step with the roster the way an incremental update can.
+   */
+  setSquad(entries: SquadEntry[]) {
+    const list = this.squad;
+    if (entries.length <= 1) {
+      list.classList.remove('show');
+      list.innerHTML = '';
+      return;
+    }
+    list.classList.add('show');
+    list.innerHTML = '';
+
+    for (const entry of entries) {
+      const row = document.createElement('div');
+      row.className = `row${entry.self ? ' self' : ''}${entry.downed || !entry.alive ? ' down' : ''}`;
+      row.style.color = entry.color;
+
+      const pip = document.createElement('div');
+      pip.className = 'pip';
+      row.appendChild(pip);
+
+      const name = document.createElement('div');
+      name.className = 'name';
+      // The name came off the network: never innerHTML.
+      name.textContent = entry.name;
+      // Colour is carried by the pip alone; the label stays legible cream.
+      name.style.color = '';
+      row.appendChild(name);
+
+      const score = document.createElement('div');
+      score.className = 'score';
+      score.textContent = String(entry.points);
+      row.appendChild(score);
+
+      list.appendChild(row);
+    }
   }
 
   setPerks(owned: Set<string>) {
@@ -284,8 +406,15 @@ export class HUD {
     (this.root.querySelector('#crosshair') as HTMLElement).style.opacity = visible ? '1' : '0';
   }
 
-  hitmark(kill: boolean) {
+  /**
+   * `headshot` was already being computed by `WeaponSystem` and thrown away
+   * here. It is worth showing: a headshot kill is the thing the player was
+   * aiming for, and in co-op it is also the only marker that distinguishes a
+   * kill the host confirmed for you from an ordinary hit.
+   */
+  hitmark(kill: boolean, headshot = false) {
     this.hitmarker.classList.toggle('kill', kill);
+    this.hitmarker.classList.toggle('headshot', kill && headshot);
     this.hitmarkerTimer = kill ? 0.34 : 0.18;
   }
 

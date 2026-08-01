@@ -6,6 +6,20 @@ export const invLerp = (a: number, b: number, v: number) => (b === a ? 0 : (v - 
 export const smoothstep = (t: number) => t * t * (3 - 2 * t);
 export const TAU = Math.PI * 2;
 
+/**
+ * Angle interpolation the short way round.
+ *
+ * Plain `lerp` between 350° and 10° sweeps 340° backwards through the whole
+ * circle; anything reading an interpolated yaw off the network needs this
+ * instead, since wrapping happens constantly and always at the worst moment.
+ */
+export const lerpAngle = (a: number, b: number, t: number) => {
+  let d = (b - a) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return a + d * t;
+};
+
 /** Frame-rate independent exponential smoothing. `rate` is roughly "per second". */
 export const damp = (current: number, target: number, rate: number, dt: number) =>
   lerp(current, target, 1 - Math.exp(-rate * dt));

@@ -13,8 +13,9 @@ import { clamp, lerp, makeFbm, smoothstep } from '../util/math';
  *
  * Every surface in the game is authored here as a per-texel `Sample` function
  * that returns albedo, roughness, metalness, ambient occlusion and a height
- * value. One pass fills all four maps; the normal map is then derived from the
- * height channel with a wrapped Sobel filter so it tiles seamlessly.
+ * value. One pass fills albedo, a packed AO/roughness/metalness map and height;
+ * the normal map is then derived from height with a wrapped Sobel filter so it
+ * tiles seamlessly.
  *
  * This exists because the build has no access to a licensed texture library.
  * Generating real map sets — rather than assigning flat colours — is what keeps
@@ -46,6 +47,15 @@ export interface MapSet {
 }
 
 const scratch: Sample = { r: 0, g: 0, b: 0, rough: 1, metal: 0, ao: 1, height: 0.5 };
+
+let textureScale = 1;
+let maxAnisotropy = 8;
+
+/** Applies the selected quality tier before any surfaces are requested. */
+export function configureTextureQuality(scale: number, anisotropy: number) {
+  textureScale = clamp(scale, 0.25, 1);
+  maxAnisotropy = Math.max(1, Math.floor(anisotropy));
+}
 
 function makeCanvas(size: number): HTMLCanvasElement {
   const c = document.createElement('canvas');
@@ -127,14 +137,16 @@ export function bake(
   sample: (u: number, v: number, out: Sample) => void,
   opts: BakeOptions = {},
 ): MapSet {
-  const size = opts.size ?? 512;
+  const requestedSize = opts.size ?? 512;
+  // A 128 px floor keeps compact weapon surfaces readable on the low tier.
+  const size = Math.max(128, Math.round(requestedSize * textureScale));
   const strength = opts.normalStrength ?? 2.2;
-  const aniso = opts.anisotropy ?? 8;
+  const aniso = Math.min(opts.anisotropy ?? 8, maxAnisotropy);
 
   const albedo = new ImageData(size, size);
-  const rough = new ImageData(size, size);
-  const metal = new ImageData(size, size);
-  const ao = new ImageData(size, size);
+  // Three reads AO from red, roughness from green and metalness from blue, so
+  // all three scalar maps can share one GPU texture and one canvas upload.
+  const orm = new ImageData(size, size);
   const height = new Float32Array(size * size);
 
   const inv = 1 / size;
@@ -154,26 +166,23 @@ export function bake(
       albedo.data[i + 3] = 255;
 
       const rv = clamp(scratch.rough, 0, 1) * 255;
-      rough.data[i] = rough.data[i + 1] = rough.data[i + 2] = rv;
-      rough.data[i + 3] = 255;
-
       const mv = clamp(scratch.metal, 0, 1) * 255;
-      metal.data[i] = metal.data[i + 1] = metal.data[i + 2] = mv;
-      metal.data[i + 3] = 255;
-
       const av = clamp(scratch.ao, 0, 1) * 255;
-      ao.data[i] = ao.data[i + 1] = ao.data[i + 2] = av;
-      ao.data[i + 3] = 255;
+      orm.data[i] = av;
+      orm.data[i + 1] = rv;
+      orm.data[i + 2] = mv;
+      orm.data[i + 3] = 255;
 
       height[y * size + x] = scratch.height;
     }
   }
 
+  const ormMap = toTexture(orm, size, false, aniso);
   return {
     map: toTexture(albedo, size, true, aniso),
-    roughnessMap: toTexture(rough, size, false, aniso),
-    metalnessMap: toTexture(metal, size, false, aniso),
-    aoMap: toTexture(ao, size, false, aniso),
+    roughnessMap: ormMap,
+    metalnessMap: ormMap,
+    aoMap: ormMap,
     normalMap: toTexture(normalFromHeight(height, size, strength), size, false, aniso),
   };
 }
@@ -230,17 +239,45 @@ export type SurfaceId =
   | 'tile'
   | 'paintedMetal'
   | 'zombieSkin'
-  | 'zombieCloth';
+  | 'zombieCloth'
+  | 'camoWoodland'
+  | 'camoArid'
+  | 'camoDesert'
+  | 'camoUrban'
+  | 'cordura'
+  | 'soldierSkin';
 
 const cache = new Map<string, MapSet>();
 
 export function surface(id: SurfaceId, opts: BakeOptions = {}): MapSet {
-  const key = `${id}:${opts.size ?? 512}`;
+  // Every option that changes pixels or sampling belongs in the key. Omitting
+  // normal strength or anisotropy returned a previously baked but incompatible
+  // map set when callers requested the same surface at the same size.
+  const key = [
+    id,
+    opts.size ?? 'default',
+    opts.normalStrength ?? 'default',
+    opts.anisotropy ?? 'default',
+    textureScale,
+    maxAnisotropy,
+  ].join(':');
   const hit = cache.get(key);
   if (hit) return hit;
   const built = build(id, opts);
   cache.set(key, built);
   return built;
+}
+
+/** Bakes expensive startup surfaces one at a time so the loader can repaint. */
+export async function prewarmSurfaces(
+  ids: readonly SurfaceId[],
+  onProgress?: (completed: number, total: number) => void,
+) {
+  for (let i = 0; i < ids.length; i++) {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    surface(ids[i]);
+    onProgress?.(i + 1, ids.length);
+  }
 }
 
 function build(id: SurfaceId, opts: BakeOptions): MapSet {
@@ -271,6 +308,18 @@ function build(id: SurfaceId, opts: BakeOptions): MapSet {
       return bakeZombieSkin(opts);
     case 'zombieCloth':
       return bakeZombieCloth(opts);
+    case 'camoWoodland':
+      return bakeCamo(opts, CAMO.woodland);
+    case 'camoArid':
+      return bakeCamo(opts, CAMO.arid);
+    case 'camoDesert':
+      return bakeCamo(opts, CAMO.desert);
+    case 'camoUrban':
+      return bakeCamo(opts, CAMO.urban);
+    case 'cordura':
+      return bakeCordura(opts);
+    case 'soldierSkin':
+      return bakeSoldierSkin(opts);
   }
 }
 
@@ -650,101 +699,408 @@ function bakePaintedMetal(o: BakeOptions): MapSet {
   }, { normalStrength: 1.5, ...o });
 }
 
+/**
+ * Decaying flesh.
+ *
+ * The hard constraint here is *low* albedo contrast. This map is applied at
+ * 3.2 tiles per metre, so one tile covers a 310 mm patch of body: any strong
+ * high-frequency detail lands at a few millimetres on screen and turns the whole
+ * character into static, which destroys the shading that makes a face readable.
+ * All the fine scale therefore lives in the height/normal and roughness
+ * channels, and the albedo carries only large, soft discoloration.
+ *
+ * Sample albedo is LINEAR — `bake` sRGB-encodes it — so these values are darker
+ * than the colours they produce on screen.
+ */
 function bakeZombieSkin(o: BakeOptions): MapSet {
-  const mottle = makeFbm(11101, { octaves: 5, frequency: 6 });
-  const pores = makeFbm(11102, { octaves: 3, frequency: 90 });
-  const veins = makeFbm(11103, { octaves: 4, frequency: 7, ridged: true });
-  const rot = makeFbm(11104, { octaves: 4, frequency: 3 });
-  const bruise = makeFbm(11105, { octaves: 3, frequency: 2 });
+  const macro = makeFbm(11101, { octaves: 3, frequency: 2.1 });
+  const mid = makeFbm(11102, { octaves: 4, frequency: 5.5 });
+  const livor = makeFbm(11106, { octaves: 3, frequency: 3.1 });
+  const bruise = makeFbm(11107, { octaves: 3, frequency: 4.4 });
+  // Subcutaneous veining. Ridged noise gives the branching filament network
+  // that a starved, translucent corpse shows through the skin.
+  const veins = makeFbm(11105, { octaves: 3, frequency: 4.5, ridged: true });
+  const dry = makeFbm(11109, { octaves: 4, frequency: 13 });
+  const pores = makeFbm(11104, { octaves: 3, frequency: 62 });
+  const wet = makeFbm(11111, { octaves: 3, frequency: 2.6 });
 
   return bake((u, v, s) => {
-    const m = mottle(u, v);
+    const M = macro(u, v);
+    const m = mid(u, v);
     const p = pores(u, v);
-    const vein = smoothstep(clamp((veins(u, v) - 0.74) * 8, 0, 1));
-    const necrosis = smoothstep(clamp((rot(u, v) - 0.5) * 3, 0, 1));
-    const br = bruise(u, v);
+    const dr = dry(u, v);
 
-    // Drained, sallow flesh — desaturated with a sickly green undertone.
-    let r = 0.235 + m * 0.11 + p * 0.03;
-    let g = 0.215 + m * 0.105 + p * 0.028;
-    let b = 0.18 + m * 0.08 + p * 0.022;
+    // Base: drained grey with a faint olive cast.
+    let r = 0.238;
+    let g = 0.236;
+    let b = 0.208;
 
-    // Necrotic patches go grey-green and dark.
-    r = lerp(r, 0.1, necrosis * 0.85);
-    g = lerp(g, 0.115, necrosis * 0.85);
-    b = lerp(b, 0.085, necrosis * 0.85);
+    // Broad putrefactive discoloration — greenish over the belly and flanks.
+    const green = clamp((M - 0.46) * 2.1, 0, 1);
+    r = lerp(r, 0.196, green * 0.6);
+    g = lerp(g, 0.236, green * 0.6);
+    b = lerp(b, 0.158, green * 0.6);
 
-    // Subdermal bruising: purple bleeding under the surface.
-    const bruising = smoothstep(clamp((br - 0.55) * 3, 0, 1)) * 0.6;
-    r = lerp(r, 0.14, bruising);
-    g = lerp(g, 0.08, bruising);
-    b = lerp(b, 0.13, bruising);
+    // Livor mortis: dull purple-brown pooling.
+    const pool = clamp((livor(u, v) - 0.53) * 2.5, 0, 1);
+    r = lerp(r, 0.252, pool * 0.6);
+    g = lerp(g, 0.168, pool * 0.6);
+    b = lerp(b, 0.192, pool * 0.6);
 
-    // Dark, engorged vessels close to the surface.
-    r = lerp(r, 0.075, vein * 0.7);
-    g = lerp(g, 0.055, vein * 0.7);
-    b = lerp(b, 0.07, vein * 0.7);
+    // Old bruising: cooler and darker, sitting under the surface.
+    const deep = clamp((bruise(u, v) - 0.62) * 2.8, 0, 1);
+    r = lerp(r, 0.13, deep * 0.55);
+    g = lerp(g, 0.125, deep * 0.55);
+    b = lerp(b, 0.145, deep * 0.55);
 
-    s.r = r;
-    s.g = g;
-    s.b = b;
+    // Gentle value mottling. Deliberately small: +/-5% is the difference
+    // between skin and camouflage.
+    const tone = (m - 0.5) * 0.055 + (M - 0.5) * 0.035;
+    r += tone;
+    g += tone * 0.96;
+    b += tone * 0.88;
+
+    // Veins read mostly as height; only a whisper of them is in the albedo.
+    const vein = clamp((veins(u, v) - 0.7) * 3.4, 0, 1);
+    r = lerp(r, 0.176, vein * 0.3);
+    g = lerp(g, 0.186, vein * 0.3);
+    b = lerp(b, 0.196, vein * 0.3);
+
+    // Dried, cracked patches: slightly darker, much rougher.
+    const cracked = clamp((dr - 0.58) * 2.4, 0, 1);
+    r = lerp(r, 0.168, cracked * 0.45);
+    g = lerp(g, 0.158, cracked * 0.45);
+    b = lerp(b, 0.132, cracked * 0.45);
+
+    const poreShift = (p - 0.5) * 0.014;
+    s.r = clamp(r + poreShift, 0, 1);
+    s.g = clamp(g + poreShift, 0, 1);
+    s.b = clamp(b + poreShift * 0.9, 0, 1);
     s.metal = 0;
-    // Wet necrosis is glossier than the dry surrounding skin — this contrast is
-    // what stops the model reading as plastic.
-    s.rough = clamp(0.78 - necrosis * 0.3 + p * 0.1, 0.18, 1);
-    s.ao = 1 - vein * 0.3 - necrosis * 0.2;
-    s.height = clamp(0.6 + p * 0.25 - vein * 0.35 - necrosis * 0.15, 0, 1);
-  }, { normalStrength: 1.8, ...o });
+
+    // Corpses are matte where they have dried and slick where fluid has wept
+    // out; that split is most of what stops flesh reading as clay.
+    const slick = clamp((wet(u, v) - 0.55) * 2.6, 0, 1);
+    s.rough = clamp(0.86 - slick * 0.34 + cracked * 0.1, 0.3, 1);
+    s.ao = clamp(1 - vein * 0.16 - cracked * 0.1 - deep * 0.1, 0.62, 1);
+    s.height = clamp(
+      0.55 + (p - 0.5) * 0.3 + (m - 0.5) * 0.22 - vein * 0.32 - cracked * 0.18,
+      0,
+      1,
+    );
+  }, { normalStrength: 0.95, ...o });
 }
 
+/**
+ * Field uniform twill: faded, filthy and worn thin.
+ *
+ * The tears themselves are geometry (see `raggedSurface` in ZombieMesh), so this
+ * map only has to supply weave, grime and staining. Contrast is kept low for the
+ * same reason as the skin — at 3.2 tiles per metre, a busy albedo reads as
+ * camouflage print rather than as dirt.
+ */
 function bakeZombieCloth(o: BakeOptions): MapSet {
-  const weave = makeFbm(12101, { octaves: 3, frequency: 120 });
-  const dirt = makeFbm(12102, { octaves: 5, frequency: 4 });
-  const tear = makeFbm(12103, { octaves: 4, frequency: 3.5, ridged: true });
-  const blood = makeFbm(12104, { octaves: 4, frequency: 3 });
+  const weave = makeFbm(12101, { octaves: 3, frequency: 90 });
+  const dirt = makeFbm(12102, { octaves: 4, frequency: 3.2 });
+  const wear = makeFbm(12103, { octaves: 3, frequency: 6 });
+  const blood = makeFbm(12104, { octaves: 4, frequency: 2.6 });
 
   return bake((u, v, s) => {
-    // Cross-hatched weave gives cloth its characteristic micro-normal.
-    // 64 cycles over a 512px bake keeps the weave above 8 texels per thread —
-    // any tighter and it aliases into hard black cracks under mipmapping.
-    const warp = Math.abs(Math.sin(u * 64 * Math.PI));
-    const weft = Math.abs(Math.sin(v * 64 * Math.PI));
-    const cloth = (warp * 0.5 + weft * 0.5) * 0.5 + weave(u, v) * 0.5;
+    // 2/1 twill. The diagonal rib is what distinguishes a uniform's cloth from
+    // a bedsheet, and a plain cross-hatch cannot produce it. 88 cycles over a
+    // 512 px bake keeps a thread near 6 texels; much tighter and it aliases
+    // into hard black cracks under mipmapping.
+    const threads = 88;
+    const rib = Math.abs(Math.sin((u + v * 0.5) * threads * Math.PI));
+    const weft = Math.abs(Math.sin(v * threads * Math.PI));
+    const cloth = rib * 0.5 + weft * 0.2 + weave(u, v) * 0.3;
 
     const d = dirt(u, v);
-    // A handful of holes, not an all-over pattern: a high threshold with a
-    // soft ramp keeps the garment reading as cloth that has been through
-    // something, rather than as camouflage print.
-    const rip = smoothstep(clamp((tear(u, v) - 0.93) * 9, 0, 1));
-    const bl = smoothstep(clamp((blood(u, v) - 0.66) * 3.2, 0, 1));
+    const abrasion = clamp((wear(u, v) - 0.56) * 2.6, 0, 1);
+    const bl = smoothstep(clamp((blood(u, v) - 0.7) * 3.2, 0, 1));
 
-    // Faded workwear, filthy. Kept mid-value so the per-zombie tints in
-    // ZombieMesh actually read as different garments rather than all black.
-    let r = 0.2 + cloth * 0.07;
-    let g = 0.205 + cloth * 0.072;
-    let b = 0.215 + cloth * 0.075;
+    // Faded workwear. Kept mid-value so the per-zombie tints in ZombieMesh read
+    // as different garments rather than all as black.
+    let r = 0.216 + cloth * 0.055;
+    let g = 0.222 + cloth * 0.057;
+    let b = 0.228 + cloth * 0.058;
 
-    const grime = smoothstep(clamp((d - 0.4) * 2.4, 0, 1)) * 0.7;
-    r = lerp(r, 0.09, grime);
-    g = lerp(g, 0.081, grime);
-    b = lerp(b, 0.066, grime);
+    const grime = clamp((d - 0.44) * 2.2, 0, 1) * 0.75;
+    r = lerp(r, 0.098, grime);
+    g = lerp(g, 0.09, grime);
+    b = lerp(b, 0.074, grime);
+
+    // Rubbed-through areas go pale and shiny where the nap has worn away.
+    r = lerp(r, 0.26, abrasion * 0.4);
+    g = lerp(g, 0.258, abrasion * 0.4);
+    b = lerp(b, 0.24, abrasion * 0.4);
 
     // Dried arterial staining — dark, desaturated, not comic-book red.
-    r = lerp(r, 0.085, bl);
-    g = lerp(g, 0.016, bl);
-    b = lerp(b, 0.014, bl);
-
-    // Torn-through areas darken to shadow.
-    r *= 1 - rip * 0.62;
-    g *= 1 - rip * 0.62;
-    b *= 1 - rip * 0.62;
+    r = lerp(r, 0.082, bl);
+    g = lerp(g, 0.019, bl);
+    b = lerp(b, 0.016, bl);
 
     s.r = r;
     s.g = g;
     s.b = b;
     s.metal = 0;
-    s.rough = clamp(0.94 - bl * 0.18, 0, 1);
-    s.ao = 1 - rip * 0.45 - grime * 0.1;
-    s.height = clamp(0.62 + cloth * 0.16 - rip * 0.4, 0, 1);
-  }, { normalStrength: 1.6, ...o });
+    s.rough = clamp(0.95 - bl * 0.2 - abrasion * 0.12, 0, 1);
+    s.ao = 1 - grime * 0.12;
+    s.height = clamp(0.62 + cloth * 0.2 - abrasion * 0.1, 0, 1);
+  }, { normalStrength: 1.15, ...o });
+}
+
+/* ------------------------------------------------------------------ */
+/* Player operators                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `makeFbm` returns roughly 0.31..0.68 rather than a full 0..1, so a threshold
+ * written as if the field spanned the unit interval silently keeps or deletes
+ * the entire pattern. Everything below thresholds against this remap instead.
+ */
+const fbmNorm = (x: number) => clamp((x - 0.34) / 0.32, 0, 1);
+
+interface CamoPalette {
+  /** The ground colour the pattern is printed on. */
+  base: [number, number, number];
+  /**
+   * Three overprint colours, applied in order at rising thresholds. Real
+   * disruptive patterns are layered prints, not a mosaic of equal partners:
+   * the first colour covers most of the ground, the last is a sparse accent.
+   */
+  blobs: [number, number, number][];
+  thresholds: [number, number, number];
+  /** Frequency of each blob field, in tiles. Different scales stop the three reading as one. */
+  scales: [number, number, number];
+  /**
+   * Cells across the tile for a pixelated (digital) print, or 0 for an organic
+   * one. Quantising the *lookup* rather than the output keeps the blob shapes
+   * intact and just steps their boundaries, which is exactly what a digital
+   * pattern is.
+   */
+  digital: number;
+}
+
+const CAMO: Record<'woodland' | 'arid' | 'desert' | 'urban', CamoPalette> = {
+  // Temperate woodland: dark green ground, olive and brown over it, black last.
+  woodland: {
+    base: [0.088, 0.104, 0.068],
+    blobs: [[0.134, 0.14, 0.086], [0.078, 0.064, 0.042], [0.03, 0.034, 0.028]],
+    thresholds: [0.44, 0.6, 0.72],
+    scales: [6.4, 10.5, 16],
+    digital: 0,
+  },
+  // Multicam-adjacent: pale khaki ground with green and umber, cream highlights.
+  arid: {
+    base: [0.178, 0.156, 0.106],
+    blobs: [[0.112, 0.118, 0.076], [0.098, 0.076, 0.048], [0.222, 0.202, 0.146]],
+    thresholds: [0.42, 0.62, 0.78],
+    scales: [5.6, 9.2, 15],
+    digital: 0,
+  },
+  // Three-colour desert: sand, pale stone, and a sparse dark brown.
+  desert: {
+    base: [0.208, 0.18, 0.128],
+    blobs: [[0.166, 0.146, 0.102], [0.242, 0.218, 0.166], [0.082, 0.066, 0.045]],
+    thresholds: [0.4, 0.62, 0.8],
+    scales: [4.8, 8.4, 13.5],
+    digital: 0,
+  },
+  // Urban digital: greyscale, quantised onto a grid so the boundaries step
+  // instead of curving.
+  urban: {
+    base: [0.136, 0.14, 0.146],
+    blobs: [[0.078, 0.082, 0.09], [0.196, 0.199, 0.206], [0.036, 0.038, 0.044]],
+    thresholds: [0.44, 0.64, 0.79],
+    scales: [6.8, 11.5, 18],
+    digital: 128,
+  },
+};
+
+/**
+ * Printed camouflage on ripstop combat cloth.
+ *
+ * Two things make this read as a uniform rather than as noise. The pattern is
+ * *printed*, so it changes the albedo and nothing else — roughness, height and
+ * normal all come from the weave underneath, and a blob boundary that also
+ * moved the surface would read as a paint spill. And the cloth is ripstop: a
+ * heavier reinforcing thread every eighth pick, which puts a faint square grid
+ * over the whole garment and is the single most recognisable feature of modern
+ * field clothing at any distance.
+ */
+function bakeCamo(o: BakeOptions, palette: CamoPalette): MapSet {
+  const seed = Math.round(palette.base[0] * 9973 + palette.thresholds[0] * 331);
+  const f1 = makeFbm(seed + 401, { octaves: 4, frequency: palette.scales[0] });
+  const f2 = makeFbm(seed + 402, { octaves: 4, frequency: palette.scales[1] });
+  const f3 = makeFbm(seed + 403, { octaves: 3, frequency: palette.scales[2] });
+  const weave = makeFbm(seed + 404, { octaves: 3, frequency: 110 });
+  const wear = makeFbm(seed + 405, { octaves: 4, frequency: 5.5 });
+  const dirt = makeFbm(seed + 406, { octaves: 4, frequency: 3 });
+
+  const cell = palette.digital;
+  const snap = (x: number) => (cell > 0 ? (Math.floor(x * cell) + 0.5) / cell : x);
+
+  return bake((u, v, s) => {
+    // Ripstop: a fine plain weave with a heavy thread every 8th pick.
+    const threads = 104;
+    const warp = Math.abs(Math.sin(u * threads * Math.PI));
+    const weft = Math.abs(Math.sin(v * threads * Math.PI));
+    const ripU = Math.pow(Math.abs(Math.sin(u * (threads / 8) * Math.PI)), 14);
+    const ripV = Math.pow(Math.abs(Math.sin(v * (threads / 8) * Math.PI)), 14);
+    const rip = Math.max(ripU, ripV);
+    const cloth = warp * 0.34 + weft * 0.34 + weave(u, v) * 0.32;
+
+    const pu = snap(u);
+    const pv = snap(v);
+    let [r, g, b] = palette.base;
+    const layer = (field: number, threshold: number, colour: [number, number, number]) => {
+      // A hard step would alias badly at mip level 3+; two texels of ramp keeps
+      // the edge crisp on screen and stable in the distance.
+      const k = smoothstep(clamp((field - threshold) * 26, 0, 1));
+      if (k <= 0) return;
+      r = lerp(r, colour[0], k);
+      g = lerp(g, colour[1], k);
+      b = lerp(b, colour[2], k);
+    };
+    layer(fbmNorm(f1(pu, pv)), palette.thresholds[0], palette.blobs[0]);
+    layer(fbmNorm(f2(pu, pv)), palette.thresholds[1], palette.blobs[1]);
+    layer(fbmNorm(f3(pu, pv)), palette.thresholds[2], palette.blobs[2]);
+
+    // Weave shading rides on top of the print, so threads cross blob edges.
+    const shade = 0.86 + cloth * 0.24 + rip * 0.1;
+    r *= shade;
+    g *= shade;
+    b *= shade;
+
+    // Sun-bleaching lifts and desaturates; field dirt darkens toward umber.
+    // Deliberately weak: a pattern is only camouflage while the *contrast*
+    // between its colours survives, and a strong bleach pass washes four
+    // distinct uniforms into four shades of the same pale sand.
+    const bleach = clamp((fbmNorm(wear(u, v)) - 0.62) * 2.4, 0, 1) * 0.3;
+    const grey = (r + g + b) / 3;
+    r = lerp(r, lerp(grey, 0.2, 0.35), bleach);
+    g = lerp(g, lerp(grey, 0.19, 0.35), bleach);
+    b = lerp(b, lerp(grey, 0.175, 0.35), bleach);
+
+    const grime = clamp((fbmNorm(dirt(u, v)) - 0.62) * 2.6, 0, 1) * 0.55;
+    r = lerp(r, 0.082, grime);
+    g = lerp(g, 0.072, grime);
+    b = lerp(b, 0.058, grime);
+
+    s.r = r;
+    s.g = g;
+    s.b = b;
+    s.metal = 0;
+    // Cotton-nylon field cloth is matt everywhere; the ripstop thread is the
+    // only part with any sheen at all, because it is the only synthetic one.
+    s.rough = clamp(0.96 - rip * 0.12 - bleach * 0.05, 0, 1);
+    s.ao = 1 - grime * 0.1;
+    s.height = clamp(0.6 + cloth * 0.16 + rip * 0.22, 0, 1);
+  }, { normalStrength: 1.25, ...o });
+}
+
+/**
+ * 1000-denier Cordura: plate carriers, pouches, slings and holsters.
+ *
+ * The whole point of giving kit its own bake rather than reusing the uniform's
+ * is that nylon and cotton do not respond to light the same way. This weave is
+ * coarse and basket-patterned rather than fine and ribbed, the fibres are
+ * synthetic so there is a broad low-gloss sheen instead of a matt nap, and it
+ * is far more uniform in colour — webbing does not sun-bleach in patches the
+ * way a printed uniform does.
+ */
+function bakeCordura(o: BakeOptions): MapSet {
+  const fuzz = makeFbm(20301, { octaves: 3, frequency: 140 });
+  const wear = makeFbm(20302, { octaves: 4, frequency: 7 });
+  const dirt = makeFbm(20303, { octaves: 4, frequency: 3.4 });
+
+  return bake((u, v, s) => {
+    // Basket weave: 2x2 bundles, so the repeat is a chequer of crossing
+    // groups rather than a single-thread grid.
+    const bundles = 46;
+    const bu = u * bundles;
+    const bv = v * bundles;
+    const cellU = Math.floor(bu) % 2;
+    const cellV = Math.floor(bv) % 2;
+    const overUnder = cellU === cellV;
+    const ridge = overUnder
+      ? Math.abs(Math.sin(bv * Math.PI))
+      : Math.abs(Math.sin(bu * Math.PI));
+    const weave = ridge * 0.72 + fuzz(u, v) * 0.28;
+
+    const scuff = clamp((fbmNorm(wear(u, v)) - 0.6) * 3, 0, 1);
+    const grime = clamp((fbmNorm(dirt(u, v)) - 0.55) * 2.2, 0, 1) * 0.5;
+
+    // Neutral mid-grey base: everything that uses this bake tints it, and a
+    // bake that already has a colour of its own fights every tint applied to it.
+    let base = 0.2 + weave * 0.075;
+    base = lerp(base, 0.245, scuff * 0.5);
+    const r = lerp(base * 1.01, 0.075, grime);
+    const g = lerp(base, 0.07, grime);
+    const b = lerp(base * 0.97, 0.062, grime);
+
+    s.r = r;
+    s.g = g;
+    s.b = b;
+    s.metal = 0;
+    // Nylon's sheen is what separates a pouch from the shirt behind it.
+    s.rough = clamp(0.78 + weave * 0.1 - scuff * 0.16, 0, 1);
+    s.ao = 1 - (1 - ridge) * 0.14 - grime * 0.08;
+    s.height = clamp(0.55 + weave * 0.34 - scuff * 0.08, 0, 1);
+  }, { normalStrength: 1.5, ...o });
+}
+
+/**
+ * Living skin. The zombie bake is the same idea run the other way: this one has
+ * blood in it, so the mid-tones stay warm, the pores are shallower, and the
+ * only large-scale variation is the flush over cheeks and knuckles rather than
+ * lividity. Kept close to neutral in hue so the per-operator tints in
+ * `SoldierMesh` decide complexion rather than fighting a baked-in one.
+ */
+function bakeSoldierSkin(o: BakeOptions): MapSet {
+  const pores = makeFbm(20401, { octaves: 3, frequency: 150 });
+  const grain = makeFbm(20402, { octaves: 4, frequency: 42 });
+  const flush = makeFbm(20403, { octaves: 3, frequency: 4.5 });
+  const stubbleField = makeFbm(20404, { octaves: 2, frequency: 190 });
+
+  return bake((u, v, s) => {
+    const p = pores(u, v);
+    const gr = grain(u, v);
+    const fl = fbmNorm(flush(u, v));
+
+    // Warm mid-brown base. Bright enough that a dark complexion tint still has
+    // somewhere to go, and neutral enough that a pale one does not go pink.
+    //
+    // The channel spread is small on purpose. Skin is far less saturated than
+    // it looks — push the red/blue ratio past about 1.3 and every complexion,
+    // whatever tint is applied on top, comes out of the tone mapper as the same
+    // orange rubber.
+    const tone = 0.27 + gr * 0.05 + p * 0.03;
+    let r = tone * 1.07;
+    let g = tone * 0.97;
+    let b = tone * 0.9;
+
+    // Capillary flush — warmer and slightly redder over the raised areas.
+    r = lerp(r, r * 1.08, fl);
+    g = lerp(g, g * 0.99, fl);
+    b = lerp(b, b * 0.96, fl);
+
+    // Follicles: a very fine dark speckle that keeps a shaved head and a
+    // forearm from reading as moulded rubber.
+    const follicle = clamp((stubbleField(u, v) - 0.58) * 5, 0, 1) * 0.16;
+    r *= 1 - follicle;
+    g *= 1 - follicle;
+    b *= 1 - follicle * 0.9;
+
+    s.r = r;
+    s.g = g;
+    s.b = b;
+    s.metal = 0;
+    // Skin is glossier than any cloth on the model — that contrast at the
+    // collar and the cuffs is most of what sells the material split.
+    s.rough = clamp(0.62 + p * 0.16 - fl * 0.06, 0, 1);
+    s.ao = 1 - (1 - p) * 0.06;
+    s.height = clamp(0.55 + p * 0.28 + gr * 0.1, 0, 1);
+  }, { normalStrength: 0.9, ...o });
 }

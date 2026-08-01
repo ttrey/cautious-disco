@@ -73,16 +73,16 @@ interface Hitbox {
 
 const HITBOXES: Hitbox[] = [
   { from: 'head', to: null, extend: new Vector3(0, 0.2, 0), radius: 0.115, multiplier: 1, label: 'head' },
-  { from: 'hips', to: 'chest', extend: null, radius: 0.2, multiplier: 1, label: 'torso' },
-  { from: 'chest', to: 'neck', extend: null, radius: 0.19, multiplier: 1, label: 'torso' },
-  { from: 'upperArmL', to: 'lowerArmL', extend: null, radius: 0.085, multiplier: 0.65, label: 'limb' },
+  { from: 'hips', to: 'chest', extend: null, radius: 0.27, multiplier: 1, label: 'torso' },
+  { from: 'chest', to: 'neck', extend: null, radius: 0.225, multiplier: 1, label: 'torso' },
+  { from: 'upperArmL', to: 'lowerArmL', extend: null, radius: 0.095, multiplier: 0.65, label: 'limb' },
   { from: 'lowerArmL', to: 'handL', extend: null, radius: 0.07, multiplier: 0.6, label: 'limb' },
-  { from: 'upperArmR', to: 'lowerArmR', extend: null, radius: 0.085, multiplier: 0.65, label: 'limb' },
+  { from: 'upperArmR', to: 'lowerArmR', extend: null, radius: 0.095, multiplier: 0.65, label: 'limb' },
   { from: 'lowerArmR', to: 'handR', extend: null, radius: 0.07, multiplier: 0.6, label: 'limb' },
-  { from: 'upLegL', to: 'lowLegL', extend: null, radius: 0.11, multiplier: 0.7, label: 'limb' },
-  { from: 'lowLegL', to: 'footL', extend: null, radius: 0.09, multiplier: 0.65, label: 'limb' },
-  { from: 'upLegR', to: 'lowLegR', extend: null, radius: 0.11, multiplier: 0.7, label: 'limb' },
-  { from: 'lowLegR', to: 'footR', extend: null, radius: 0.09, multiplier: 0.65, label: 'limb' },
+  { from: 'upLegL', to: 'lowLegL', extend: null, radius: 0.155, multiplier: 0.7, label: 'limb' },
+  { from: 'lowLegL', to: 'footL', extend: null, radius: 0.1, multiplier: 0.65, label: 'limb' },
+  { from: 'upLegR', to: 'lowLegR', extend: null, radius: 0.155, multiplier: 0.7, label: 'limb' },
+  { from: 'lowLegR', to: 'footR', extend: null, radius: 0.1, multiplier: 0.65, label: 'limb' },
 ];
 
 export interface HitResult {
@@ -172,6 +172,14 @@ export class Zombie {
   /** Radius used for separation and player-collision. */
   readonly radius = 0.34;
 
+  /**
+   * Which player in the lobby this body is going for. Meaningless in single
+   * player, and set by the host in co-op — it is what stops a zombie mauling
+   * one operator from also chewing on the teammate who happened to be standing
+   * beside them.
+   */
+  targetIndex = 0;
+
   private readonly rng: Rng;
   private readonly baseSkinColor = new Color();
   private readonly skinMaterial: MeshStandardMaterial;
@@ -235,6 +243,11 @@ export class Zombie {
     if (along < -1.2 || along > maxDist + 1.2) return null;
     if (_tmp.lengthSq() - along * along > 1.6) return null;
 
+    // Only a body that passed the coarse test needs current bone matrices.
+    // Rendering updates every visible rig later; doing it here keeps accurate
+    // same-frame hitboxes without forcing all active skeletons every frame.
+    this.rig.root.updateMatrixWorld(true);
+
     let best: HitResult | null = null;
     for (const box of HITBOXES) {
       const boneA = this.rig.bones[box.from];
@@ -274,6 +287,90 @@ export class Zombie {
       return true;
     }
     return false;
+  }
+
+  /**
+   * The visible half of taking a hit, with none of the bookkeeping.
+   *
+   * A client in a co-op game raycasts against bodies it does not own. It should
+   * still flash and flinch the moment the shot lands — waiting for the host to
+   * confirm would put a round trip between pulling the trigger and seeing
+   * anything happen, which is the difference between a gun that feels connected
+   * and one that feels broken. What it must *not* do is subtract health or
+   * decide the zombie is dead; only the host gets to say that.
+   */
+  reactToHit(hit: HitResult) {
+    if (this.state === 'dying' || this.state === 'dead') return;
+    this.flashTimer = 0.11;
+    this.animator.flinch(0.35 + (hit.label === 'head' ? 0.4 : 0));
+  }
+
+  /**
+   * Drives a body whose position and state arrive over the network.
+   *
+   * The local state machine is deliberately not run here. It would be fed
+   * interpolated positions of players it cannot see the input of, reach its own
+   * conclusions about when to swing, and disagree with the host within a second
+   * or two — at which point the zombie you are looking at is attacking
+   * something the host says it is not. So the host's `state` is taken as given
+   * and this only does the things that are purely local: play the right
+   * animation, run the damage window if the swing is aimed at *this* machine's
+   * player, and put the rig where the interpolator says it goes.
+   */
+  updateReplicated(
+    dt: number,
+    state: ZombieState,
+    distanceToLocalPlayer: number,
+    targetsLocalPlayer: boolean,
+    onAttack: (damage: number) => void,
+  ) {
+    if (!this.active) return;
+    this.animator.update(dt);
+
+    if (this.flashTimer > 0) {
+      this.flashTimer -= dt;
+      const k = clamp(this.flashTimer / 0.11, 0, 1);
+      this.skinMaterial.color
+        .copy(this.baseSkinColor)
+        .multiply(_tint.setHex(this.def.tint))
+        .lerp(_white, k * 0.75);
+    }
+
+    const previous = this.state;
+    this.state = state;
+
+    if (state === 'dying') {
+      if (previous !== 'dying') {
+        this.deathTimer = 0;
+        this.animator.playOneShot('death');
+      }
+      this.deathTimer += dt;
+      this.rig.root.position.copy(this.position);
+      this.rig.root.rotation.y = this.yaw + Math.PI;
+      return;
+    }
+
+    if (state === 'attacking') {
+      if (previous !== 'attacking') {
+        this.attackTimer = 0;
+        this.attackWindowUsed = false;
+        this.animator.playOneShot('attack');
+      }
+      this.attackTimer += dt;
+      // Same 0.5 s strike keyframe the local sim uses, so the hit lands on the
+      // frame the animation makes contact rather than when the packet arrived.
+      if (!this.attackWindowUsed && this.attackTimer > 0.5) {
+        this.attackWindowUsed = true;
+        const reach = this.radius * this.def.bulk + 0.34 + 0.9;
+        if (targetsLocalPlayer && distanceToLocalPlayer < reach) onAttack(this.def.damage);
+      }
+    } else {
+      const speed = this.velocity.length();
+      this.animator.play(speed > this.baseSpeed * 1.35 ? 'run' : 'walk', 0.3);
+    }
+
+    this.rig.root.position.copy(this.position);
+    this.rig.root.rotation.y = this.yaw + Math.PI;
   }
 
   /** Advances state that does not depend on the world (called by the manager). */

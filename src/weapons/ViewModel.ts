@@ -4,6 +4,7 @@ import {
   Color,
   CylinderGeometry,
   Group,
+  Matrix4,
   Mesh,
   MeshBasicMaterial,
   Object3D,
@@ -12,6 +13,7 @@ import {
   PointLight,
   Quaternion,
   Scene,
+  Texture,
   Vector3,
 } from 'three';
 import { GunModel } from './GunSmith';
@@ -21,13 +23,72 @@ import { solveTwoBoneIK } from '../util/ik';
 import { muzzleFlashTexture, smokeTexture } from '../assets/SpriteTextures';
 import { Presets } from '../assets/Materials';
 import { Rng, TAU, clamp, damp, lerp, smoothstep } from '../util/math';
+import { disposeModel } from '../util/dispose';
 
-const UPPER_ARM = 0.26;
-const FOREARM = 0.24;
+/**
+ * Bone lengths, which must match the capsules and joint offsets in `Arms.ts`.
+ *
+ * These are the *reach budget* for both grips, and the budget has to cover the
+ * longest weapon on the roster. At 0.26 + 0.24 from a shoulder set 140 mm
+ * behind the eye, the envelope stopped 500 mm out — while a battle rifle's
+ * handguard sits 620 mm away. `solveTwoBoneIK` clamps an unreachable target
+ * into its annulus rather than failing, so the arm silently straightened and
+ * parked the hand up to 120 mm short, holding air beside the weapon.
+ */
+const UPPER_ARM = 0.285;
+const FOREARM = 0.265;
+/** Full-ADS rotational viewmodel recoil relative to hip fire. */
+const ADS_RECOIL_ROTATION_SCALE = 0.45;
+/**
+ * Full-ADS backward travel relative to hip fire.
+ *
+ * Translation needs heavier suppression than rotation: repeated automatic
+ * shots should add a little weight, not pull the rear of the weapon into the
+ * camera.
+ */
+const ADS_RECOIL_TRANSLATION_SCALE = 0.18;
+/** Maximum visible rearward travel for the viewmodel before ADS scaling. */
+const MAX_VIEWMODEL_RECOIL_TRANSLATION = 0.055;
+/** Target decay and visible-offset follow rates are scaled by weapon recovery. */
+const RECOIL_TRANSLATION_TARGET_DECAY_SCALE = 1.15;
+const RECOIL_TRANSLATION_FOLLOW_SCALE = 6;
 
-/** Where the shoulders sit relative to the view camera. */
-const LEFT_SHOULDER = new Vector3(-0.2, -0.2, 0.14);
-const RIGHT_SHOULDER = new Vector3(0.2, -0.2, 0.14);
+/**
+ * Distance from the wrist joint to the middle of the palm in the active grip
+ * frame. Grip points are authored where the *hand* closes; the IK solves for
+ * the wrist, so each target is offset by this before being solved.
+ */
+const PALM_REACH = 0.045;
+/** Outboard wrist offset for the support hand, so its palm clears the handguard. */
+const SUPPORT_HAND_OUTBOARD = 0.035;
+
+/**
+ * How far to the side of a grip point the middle of the palm sits.
+ *
+ * A palm is 30 mm of meat that cannot occupy the same space as the grip it is
+ * holding, so a hand solved straight onto a grip point ends up inside the
+ * weapon with its fingers starting from within the frame — wrapping around
+ * nothing. The palm belongs against the flank: right hand outboard on +X, left
+ * hand on -X.
+ *
+ * Only a small nudge lives here. The wrist's own break (see `poseWrist`) already
+ * carries the hand about 18 mm outboard, and how far out the palm really needs
+ * to sit depends on how thick the thing being held is — a 24 mm carbine
+ * handguard and a 58 mm shotgun forend are not the same. That part is per
+ * weapon, in the grip points themselves.
+ */
+const PALM_STANDOFF = 0.012;
+
+/**
+ * Where the shoulders sit relative to the view camera.
+ *
+ * Forward of a real shoulder line on purpose. The viewmodel's job is to put
+ * hands on a weapon held out in front of the player, and every centimetre the
+ * anchor sits behind the eye is a centimetre of reach spent before the arm
+ * reaches the receiver, let alone the handguard.
+ */
+const LEFT_SHOULDER = new Vector3(-0.2, -0.2, 0.055);
+const RIGHT_SHOULDER = new Vector3(0.2, -0.2, 0.055);
 
 interface Shell {
   mesh: Mesh;
@@ -57,9 +118,9 @@ export class ViewModel {
   adsBlend = 0;
   private adsTarget = 0;
 
-  /** Recoil spring state. */
+  /** Recoil state. Positional kick is bounded; angular kick remains spring-driven. */
   private recoilPos = 0;
-  private recoilVel = 0;
+  private recoilPosTarget = 0;
   private recoilPitch = 0;
   private recoilPitchVel = 0;
   private recoilYaw = 0;
@@ -93,10 +154,17 @@ export class ViewModel {
   private readonly shellPool: Shell[] = [];
   private shellGeo!: BufferGeometry;
 
+  /** Field of view of the camera this scene is drawn with; see `muzzleWorld`. */
+  private viewFov = 58;
+
   private readonly rng = new Rng(0xbeef);
   private readonly tmpVec = new Vector3();
   private readonly tmpVec2 = new Vector3();
   private readonly tmpQuat = new Quaternion();
+  private readonly gripBasis = new Matrix4();
+  private readonly axisX = new Vector3();
+  private readonly axisY = new Vector3();
+  private readonly axisZ = new Vector3();
 
   constructor(private readonly viewScene: Scene) {
     this.root.add(this.gunPivot);
@@ -142,22 +210,44 @@ export class ViewModel {
   equip(def: WeaponDef) {
     if (this.gun) {
       this.gunPivot.remove(this.gun.root);
-      this.gun.root.traverse((o) => {
-        const m = o as Mesh;
-        if (m.geometry) m.geometry.dispose();
-      });
+      disposeModel(this.gun.root);
     }
     this.def = def;
     this.gun = def.build();
     this.gunPivot.add(this.gun.root);
+    this.resetReloadParts();
     this.gunPivot.add(this.flashGroup);
     this.flashGroup.position.copy(this.gun.muzzle.position);
     this.swapBlend = 0;
     this.reloadT = -1;
+    this.recoilPos = 0;
+    this.recoilPosTarget = 0;
   }
 
   setAiming(aiming: boolean) {
     this.adsTarget = aiming ? 1 : 0;
+  }
+
+  /** True when the weapon in hand carries an optic with a sight picture. */
+  get hasOptic() {
+    return !!this.gun?.sightPicture;
+  }
+
+  /**
+   * Binds the magnified world view to the optic's ocular, or `null` to leave
+   * the tube simply open — which is the right look at the hip, where the eye is
+   * nowhere near the sight and the scope should read as a hollow object.
+   */
+  setOpticView(texture: Texture | null) {
+    const lens = this.gun?.sightPicture;
+    if (!lens) return;
+    const mat = lens.material as MeshBasicMaterial;
+    if (mat.map !== texture) {
+      mat.map = texture;
+      mat.color.setHex(texture ? 0xffffff : 0x000000);
+      mat.needsUpdate = true;
+    }
+    lens.visible = texture !== null;
   }
 
   startReload(duration: number, empty: boolean) {
@@ -175,23 +265,42 @@ export class ViewModel {
 
   cancelReload() {
     this.reloadT = -1;
+    this.resetReloadParts();
   }
 
   get reloading() {
     return this.reloadT >= 0;
   }
 
+  /** Restores any weapon-specific reload props after a finish, cancel or swap. */
+  private resetReloadParts() {
+    if (!this.gun) return;
+    if (this.gun.magazine) {
+      this.gun.magazine.position.set(0, 0, 0);
+      this.gun.magazine.rotation.set(0, 0, 0);
+      this.gun.magazine.visible = true;
+    }
+    if (this.gun.charging) this.gun.charging.position.z = 0;
+    if (this.gun.feedCover) this.gun.feedCover.rotation.set(0, 0, 0);
+  }
+
   /** Kicks the whole weapon and returns the view punch for the camera. */
   fire(def: WeaponDef, shotIndex: number) {
     const r = def.recoil;
-    this.recoilVel += r.kick * 78;
-    this.recoilPitchVel += (r.vertical * Math.PI) / 180 * 34;
+    const translationScale = lerp(1, ADS_RECOIL_TRANSLATION_SCALE, this.adsBlend);
+    const rotationScale = lerp(1, ADS_RECOIL_ROTATION_SCALE, this.adsBlend);
+    this.recoilPosTarget = clamp(
+      this.recoilPosTarget + r.kick * translationScale,
+      0,
+      this.maxRecoilTranslation(r.kick, translationScale),
+    );
+    this.recoilPitchVel += (r.vertical * Math.PI) / 180 * 34 * rotationScale;
 
     // Alternating horizontal wander with a per-weapon directional bias makes
     // the pattern learnable instead of random.
     const wander = Math.sin(shotIndex * 2.399) * 0.6 + this.rng.range(-0.4, 0.4);
-    this.recoilYawVel += ((r.horizontal * (wander + r.drift)) * Math.PI) / 180 * 30;
-    this.recoilRoll += this.rng.range(-0.02, 0.02) - r.drift * 0.012;
+    this.recoilYawVel += ((r.horizontal * (wander + r.drift)) * Math.PI) / 180 * 30 * rotationScale;
+    this.recoilRoll += (this.rng.range(-0.02, 0.02) - r.drift * 0.012) * rotationScale;
 
     // View punch is damped hard when aiming — a shouldered weapon moves less.
     const adsDamp = lerp(1, 0.55, this.adsBlend);
@@ -203,17 +312,26 @@ export class ViewModel {
 
   private spawnFlash(def: WeaponDef) {
     this.flashLife = 1;
-    const scale = def.class === 'shotgun' ? 0.34 : def.class === 'rifle' ? 0.26 : 0.2;
+    const baseScale = def.class === 'shotgun' ? 0.34 : def.class === 'lmg' ? 0.29 : def.class === 'rifle' ? 0.26 : 0.2;
+    const scale = baseScale * (def.muzzleFlashScale ?? 1);
+    const energyColor = def.wonder?.kind === 'plasma'
+      ? 0x62f4ff
+      : def.wonder?.kind === 'arc'
+        ? 0xb29aff
+        : 0xffd9a0;
     for (const p of this.flashPlanes) {
       p.visible = true;
       p.scale.setScalar(scale * this.rng.range(0.82, 1.22));
       p.rotation.z = this.rng.next() * TAU;
-      (p.material as MeshBasicMaterial).opacity = this.rng.range(0.8, 1);
+      const mat = p.material as MeshBasicMaterial;
+      mat.color.setHex(energyColor);
+      mat.opacity = this.rng.range(0.8, 1);
     }
-    this.flashLight.intensity = def.class === 'shotgun' ? 26 : 16;
+    this.flashLight.color.setHex(energyColor);
+    this.flashLight.intensity = (def.class === 'shotgun' ? 26 : def.class === 'lmg' ? 20 : 16) * (def.muzzleFlashScale ?? 1);
 
     // Muzzle smoke, in the viewmodel scene so it stays attached to the gun.
-    if (this.rng.chance(def.class === 'shotgun' ? 1 : 0.55)) {
+    if (!def.wonder && this.rng.chance(def.class === 'shotgun' ? 1 : def.class === 'lmg' ? 0.72 : 0.55)) {
       this.spawnSmoke();
     }
   }
@@ -242,7 +360,8 @@ export class ViewModel {
 
   /** Ejects a spinning brass case from the port. */
   ejectShell(def: WeaponDef) {
-    if (!this.gun) return;
+    // Both wonder weapons use sealed power cells rather than cartridge cases.
+    if (!this.gun || def.wonder) return;
     let shell = this.shellPool.pop();
     if (!shell) {
       const mesh = new Mesh(this.shellGeo, Presets.brass());
@@ -251,7 +370,8 @@ export class ViewModel {
     }
     const s = shell;
     s.mesh.position.copy(this.gun.ejectPort.position);
-    s.mesh.scale.setScalar(def.class === 'shotgun' ? 1.5 : def.class === 'rifle' ? 1.15 : 1);
+    const baseShellScale = def.class === 'shotgun' ? 1.5 : def.class === 'lmg' ? 1.28 : def.class === 'rifle' ? 1.15 : 1;
+    s.mesh.scale.setScalar(baseShellScale * (def.shellScale ?? 1));
     s.mesh.rotation.set(0, 0, Math.PI / 2);
     s.vel.set(this.rng.range(1.1, 1.9), this.rng.range(0.9, 1.6), this.rng.range(-0.3, 0.35));
     s.spin.set(this.rng.range(-24, 24), this.rng.range(-18, 18), this.rng.range(-30, 30));
@@ -289,7 +409,18 @@ export class ViewModel {
 
     // --- Springs ----------------------------------------------------------
     const rec = def.recoil;
-    this.recoilPos = this.springStep(this.recoilPos, () => this.recoilVel, (v) => (this.recoilVel = v), rec.recovery * 4.2, rec.recovery * 0.9, dt);
+    const translationScale = lerp(1, ADS_RECOIL_TRANSLATION_SCALE, this.adsBlend);
+    const maxTranslation = this.maxRecoilTranslation(rec.kick, translationScale);
+    this.recoilPosTarget = clamp(
+      damp(this.recoilPosTarget, 0, rec.recovery * RECOIL_TRANSLATION_TARGET_DECAY_SCALE, dt),
+      0,
+      maxTranslation,
+    );
+    this.recoilPos = clamp(
+      damp(this.recoilPos, this.recoilPosTarget, rec.recovery * RECOIL_TRANSLATION_FOLLOW_SCALE, dt),
+      0,
+      maxTranslation,
+    );
     this.recoilPitch = this.springStep(this.recoilPitch, () => this.recoilPitchVel, (v) => (this.recoilPitchVel = v), rec.recovery * 4.6, rec.recovery, dt);
     this.recoilYaw = this.springStep(this.recoilYaw, () => this.recoilYawVel, (v) => (this.recoilYawVel = v), rec.recovery * 3.6, rec.recovery * 0.85, dt);
     this.recoilRoll = damp(this.recoilRoll, 0, rec.recovery * 0.9, dt);
@@ -314,6 +445,32 @@ export class ViewModel {
     // the origin, so the weapon transform is purely local.
     camera.position.set(0, 0, 0);
     camera.quaternion.identity();
+    this.viewFov = camera.fov;
+  }
+
+  private maxRecoilTranslation(kick: number, translationScale: number) {
+    return Math.min(MAX_VIEWMODEL_RECOIL_TRANSLATION, kick * 2 * translationScale);
+  }
+
+  /**
+   * World position of the muzzle, for effects that live in the world scene.
+   *
+   * The viewmodel is drawn by its own narrower-FOV camera parked at the origin,
+   * so a point in that scene has to be re-projected before it lines up with the
+   * world camera: the same screen position needs a smaller lateral offset the
+   * wider the FOV. Depth is unchanged.
+   */
+  muzzleWorld(worldCamera: PerspectiveCamera, out: Vector3): Vector3 {
+    if (!this.gun) return out.setFromMatrixPosition(worldCamera.matrixWorld);
+    this.gun.muzzle.updateWorldMatrix(true, false);
+    out.setFromMatrixPosition(this.gun.muzzle.matrixWorld);
+
+    const fovRatio =
+      Math.tan((this.viewFov * Math.PI) / 360) / Math.tan((worldCamera.fov * Math.PI) / 360);
+    out.x *= fovRatio;
+    out.y *= fovRatio;
+
+    return out.applyMatrix4(worldCamera.matrixWorld);
   }
 
   private springStep(
@@ -341,9 +498,14 @@ export class ViewModel {
 
     // Base: hip pose lerped toward the sight line for ADS. Bringing the weapon
     // to centre and lifting it by the sight height is what makes irons line up.
+    // Eye relief is its own number rather than a function of the hip pose —
+    // where the gun rests at the hip says nothing about how far from your eye
+    // the sights should sit, and tying them together means restyling the hip
+    // pose silently moves the sight picture (and pulls the grips out of arm's
+    // reach).
     const adsX = 0;
     const adsY = -this.gun!.sightHeight;
-    const adsZ = def.hipPosition[2] + this.gun!.sightForward;
+    const adsZ = def.adsDistance + this.gun!.sightForward;
 
     let px = lerp(hip[0], adsX, this.adsBlend);
     let py = lerp(hip[1], adsY, this.adsBlend);
@@ -383,7 +545,8 @@ export class ViewModel {
 
     this.gunPivot.position.set(px, py, pz);
 
-    let rx = lerp(def.hipRotation[0], 0, this.adsBlend) - this.recoilPitch;
+    // The bore points along -Z, so positive X rotation raises the muzzle.
+    let rx = lerp(def.hipRotation[0], 0, this.adsBlend) + this.recoilPitch;
     let ry = lerp(def.hipRotation[1], 0, this.adsBlend) + this.recoilYaw;
     let rz = lerp(def.hipRotation[2], 0, this.adsBlend) + this.recoilRoll;
 
@@ -440,6 +603,55 @@ export class ViewModel {
       return out;
     }
 
+    if (def.reloadStyle === 'belt') {
+      // Belt-fed reload: open the tray, remove the spent can, lay in a fresh
+      // belt, then close the cover. This deliberately has a different beat to
+      // a rifle's magazine drop, so the M240 feels like its own mechanism.
+      const tip = Math.sin(clamp(p / 0.30, 0, 1) * Math.PI * 0.5) * (1 - smoothstep(clamp((p - 0.80) / 0.20, 0, 1)));
+      out.roll = 0.46 * tip;
+      out.yaw = 0.20 * tip;
+      out.pitch = 0.11 * tip;
+      out.y = -0.040 * tip;
+      out.x = 0.020 * tip;
+
+      const cover = this.gun.feedCover;
+      if (cover) {
+        const open = p < 0.18
+          ? smoothstep(clamp(p / 0.18, 0, 1))
+          : 1 - smoothstep(clamp((p - 0.77) / 0.23, 0, 1));
+        // The lid's geometry extends forward (-Z) from its rear hinge. A
+        // positive X rotation carries that forward edge upward; the opposite
+        // sign drives it down through the receiver instead of opening it.
+        cover.rotation.x = open * 0.96;
+      }
+
+      const can = this.gun.magazine;
+      if (can) {
+        if (p < 0.30) {
+          const d = smoothstep(clamp(p / 0.30, 0, 1));
+          can.position.y = -d * 0.19;
+          can.position.x = d * 0.025;
+          can.rotation.z = d * 0.22;
+          can.visible = d < 0.96;
+        } else if (p < 0.62) {
+          can.visible = false;
+        } else {
+          const d = smoothstep(clamp((p - 0.62) / 0.22, 0, 1));
+          can.visible = true;
+          can.position.y = -(1 - d) * 0.15;
+          can.position.x = (1 - d) * 0.018;
+          can.rotation.z = (1 - d) * 0.16;
+        }
+      }
+
+      if (this.gun.charging && this.reloadEmpty && p > 0.83) {
+        const d = Math.sin(clamp((p - 0.83) / 0.17, 0, 1) * Math.PI);
+        this.gun.charging.position.z = d * 0.062;
+        out.pitch += d * 0.075;
+      }
+      return out;
+    }
+
     const tip = Math.sin(clamp(p / 0.35, 0, 1) * Math.PI * 0.5) * (1 - smoothstep(clamp((p - 0.78) / 0.22, 0, 1)));
     out.roll = 0.62 * tip;
     out.yaw = 0.3 * tip;
@@ -483,13 +695,7 @@ export class ViewModel {
     this.reloadT += dt / this.reloadDuration;
     if (this.reloadT >= 1) {
       this.reloadT = -1;
-      // Reset animated parts to rest.
-      if (this.gun?.magazine) {
-        this.gun.magazine.position.y = 0;
-        this.gun.magazine.rotation.z = 0;
-        this.gun.magazine.visible = true;
-      }
-      if (this.gun?.charging) this.gun.charging.position.z = 0;
+      this.resetReloadParts();
     }
     void def;
   }
@@ -499,7 +705,10 @@ export class ViewModel {
     if (!this.gun) return;
     const travel = clamp(this.recoilPos / Math.max(def.recoil.kick, 0.001), 0, 1);
     if (this.gun.slide && this.gun.slide !== this.gun.charging) {
-      this.gun.slide.position.z = travel * (def.class === 'shotgun' ? 0.06 : 0.028);
+      // The authored reciprocating part is either a pump forend or a visible
+      // bolt carrier. Its per-class travel keeps the action inside the
+      // receiver/forend envelope instead of clipping through the model.
+      this.gun.slide.position.z = travel * (def.class === 'shotgun' ? 0.05 : def.class === 'lmg' ? 0.042 : 0.028);
     } else if (this.gun.slide) {
       this.gun.slide.position.z = travel * 0.02;
     }
@@ -571,7 +780,12 @@ export class ViewModel {
     this.gunPivot.updateWorldMatrix(true, true);
 
     // Right hand: always on the fire control grip.
-    this.tmpVec.set(def.rightGrip[0], def.rightGrip[1], def.rightGrip[2]);
+    //
+    // The IK drives the *wrist joint*, which sits at the heel of the palm — but
+    // a grip is held in the middle of the palm, PALM_REACH further down the
+    // hand. Solving the wrist straight onto the grip point therefore parks the
+    // whole hand a palm's length ahead of the grip, out over the trigger guard.
+    this.tmpVec.set(def.rightGrip[0] + PALM_STANDOFF, def.rightGrip[1], def.rightGrip[2] + PALM_REACH);
     this.gunPivot.localToWorld(this.tmpVec);
     // Pole hint: elbow hangs down and out to the right.
     this.tmpVec2.set(0.55, -0.9, 0.5).add(this.tmpVec);
@@ -579,7 +793,10 @@ export class ViewModel {
     this.poseWrist(this.arms.right, 1);
 
     // Left hand: on the handguard, except mid-reload when it fetches a mag.
-    this.tmpVec.set(def.leftGrip[0], def.leftGrip[1], def.leftGrip[2]);
+    // Its wrist sits below the support point; the palm rises onto the barrel
+    // and the fingers curl inboard around it. The support grip is therefore a
+    // vertical hand frame, not the firing hand's along-the-bore frame.
+    this.tmpVec.set(def.leftGrip[0] - SUPPORT_HAND_OUTBOARD, def.leftGrip[1] - PALM_REACH * 1.5, def.leftGrip[2]);
     this.gunPivot.localToWorld(this.tmpVec);
     if (this.reloadT >= 0 && !def.shellReload) {
       const p = this.reloadT;
@@ -602,23 +819,62 @@ export class ViewModel {
   /** Orients the hand onto the grip and curls the fingers around it. */
   private poseWrist(arm: HandRig, side: number) {
     if (!this.gun) return;
-    // Align the palm with the weapon's roll so the hand wraps the grip rather
-    // than floating beside it.
-    this.gunPivot.getWorldQuaternion(this.tmpQuat);
+
+    // Build the hand's frame from the weapon's axes rather than by nudging
+    // Eulers off the weapon's own orientation.
+    //
+    // The rig's hand is +X across the knuckles, -Y down the fingers, +Z out of
+    // the palm. Closing that hand around a near-vertical grip means: palm
+    // faces inboard at the grip, fingers start pointing down the barrel and
+    // curl inboard around the front strap. That is a full permutation of the
+    // weapon's axes, nowhere near the identity — starting from the weapon's
+    // own orientation and tilting left both hands palm-up ahead of the muzzle
+    // with the fingers splayed across the sight picture.
+    this.gunPivot.updateWorldMatrix(true, false);
+    this.gunPivot.matrixWorld.extractBasis(this.axisX, this.axisY, this.axisZ);
+    if (side > 0) {
+      // Right hand: palm faces -X (inboard), fingers along -Z (down range).
+      this.gripBasis.makeBasis(this.axisY.negate(), this.axisZ, this.axisX.negate());
+    } else {
+      // Left support hand: palm faces +X, fingers rise from below the barrel
+      // and curl inboard around its handguard/fore-end.
+      this.gripBasis.makeBasis(this.axisZ, this.axisY.negate(), this.axisX);
+    }
+    this.tmpQuat.setFromRotationMatrix(this.gripBasis);
     arm.wrist.quaternion.copy(this.tmpQuat);
     arm.elbow.getWorldQuaternion(this.tmpQuat);
     arm.wrist.quaternion.premultiply(this.tmpQuat.invert());
-    arm.wrist.rotateX(side > 0 ? -1.15 : -1.05);
-    arm.wrist.rotateZ(side * 0.35);
 
-    // Trigger finger tracks the trigger; the rest hold a firm grip.
+    // Natural break at the wrist, outward on each side.
+    arm.wrist.rotateX(-0.15);
+    arm.wrist.rotateZ(side * 0.25);
+
+    // The fingers close on the grip.
+    //
+    // Knuckle and second joint each take about half of the ~180 degrees needed
+    // to bring a fingertip from the near flank, around the front strap, to the
+    // far flank. Curling the knuckle alone — however far — only sweeps a
+    // straight finger through an arc that misses the grip entirely, which is
+    // what left both hands clawing at empty air beside the weapon.
+    for (let i = 0; i < 4; i++) {
+      arm.fingers[i].rotation.x = -1.5;
+      arm.fingerTips[i].rotation.x = -1.4;
+    }
     const pull = this.gun.trigger ? -this.gun.trigger.rotation.x / 0.35 : 0;
     if (side > 0) {
-      arm.triggerFinger.rotation.x = -0.35 - pull * 0.5;
+      // The trigger finger leaves the grip for the guard. Reaching the trigger
+      // needs all three axes, not just the curl the other fingers use: the
+      // trigger sits above the knuckle row (z: the lift off the grip), inboard
+      // of it (y: the reach across to the centreline) and only 36 mm away, so
+      // the finger has to fold hard (x) rather than extend. Curl alone sweeps
+      // it straight out through the front of the trigger guard.
+      arm.triggerFinger.rotation.set(-0.42 - pull * 0.28, -0.6, -1.1);
+      arm.fingerTips[0].rotation.x = -1.98 - pull * 0.24;
     }
   }
 
   dispose() {
+    if (this.gun) disposeModel(this.gun.root);
     this.viewScene.remove(this.root);
   }
 }

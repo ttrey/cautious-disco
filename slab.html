@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Operator Lab — NECROPOLIS</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0a0b0e; overflow: hidden; }
+      #hud { position: fixed; top: 12px; left: 12px; z-index: 10; font-size: 12px; line-height: 1.6;
+        color: #cfd4dd; font-family: system-ui, sans-serif; background: rgba(0,0,0,.5);
+        padding: 9px 13px; border-radius: 6px; }
+      b { color: #ffb347; }
+    </style>
+  </head>
+  <body>
+    <div id="hud">
+      <b>Operator harness</b><br />
+      1-9 pick a view &middot; console: <b>__slab</b><br />
+      build([ids], weapon) &middot; view(name) &middot; only(mesh)<br />
+      pose(state) &middot; clip(name) &middot; step(dt) &middot; weapon(id)<br />
+      free(yaw, pitch, dist) &middot; exposure(v)
+    </div>
+    <script type="module" src="/src/dev/slab.ts"></script>
+  </body>
+</html>

@@ -16,7 +16,18 @@ const CROUCH_SPEED = 2.1;
 const ACCEL_GROUND = 62;
 const ACCEL_AIR = 11;
 const FRICTION = 13;
-const JUMP_VELOCITY = 6.4;
+/**
+ * Sized against the window sills, which every boarded aperture on the map puts
+ * at 0.9 m. Apex is v²/2g, so 6.4 reached 0.931 m — three centimetres over, and
+ * a sprinting jump spends about six frames above the sill, which is half a
+ * metre of horizontal travel against a 0.36 m wall. That was enough to vault
+ * any window: out of the start room into the sealed exterior, where there is no
+ * floor collider and the player falls out of the world, and later through the
+ * service court into rooms two doors deep that nobody had paid for. 6.0 apexes
+ * at 0.818 m — eight centimetres of margin, and still far clear of anything the
+ * player is meant to jump.
+ */
+const JUMP_VELOCITY = 6.0;
 const GRAVITY = -22;
 
 const PITCH_LIMIT = Math.PI / 2 - 0.02;
@@ -75,7 +86,11 @@ export class Player {
   onLand?: (impact: number) => void;
 
   private readonly body: RAPIER.RigidBody;
-  private readonly collider: RAPIER.Collider;
+  /**
+   * Public because the eye sits inside this capsule: any query fired from the
+   * camera has to exclude it or it reports a hit at zero distance.
+   */
+  readonly collider: RAPIER.Collider;
   private readonly controller: RAPIER.KinematicCharacterController;
 
   private readonly desiredMove = new Vector3();
