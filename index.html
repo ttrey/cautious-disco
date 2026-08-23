@@ -8,18 +8,78 @@
     <style>
       :root {
         color-scheme: dark;
-        --amber: #ffb347;
-        --blood: #b3231f;
+        --ink: #101820;
+        --amber: #ffc568;
+        --blood: #db4e3c;
+        --cream: #eff3eb;
       }
-      * { margin: 0; padding: 0; box-sizing: border-box; }
+      *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
       html, body {
         width: 100%; height: 100%; overflow: hidden;
-        background: #05060a;
-        font-family: 'Rajdhani', 'DIN Alternate', 'Oswald', system-ui, sans-serif;
+        background:
+          radial-gradient(ellipse at 50% 0%, rgba(219, 78, 60, .14), transparent 58%),
+          linear-gradient(135deg, #18242d, var(--ink));
+        color: var(--cream);
+        font-family: 'Arial Narrow', 'Avenir Next Condensed', 'Rajdhani', system-ui, sans-serif;
         -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
       }
-      #app { position: fixed; inset: 0; }
+      body::before {
+        content: '';
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        opacity: .2;
+        background: repeating-linear-gradient(0deg, rgba(255,255,255,.025) 0 1px, transparent 1px 5px);
+      }
+      #app { position: fixed; inset: 0; isolation: isolate; }
       canvas { display: block; width: 100%; height: 100%; }
+      ::selection { background: rgba(255, 197, 104, .32); color: #fff; }
+
+      /* The runtime loader is intentionally created in main.ts after the first
+         menu interaction. Theme it here through its stable progress hook so the
+         ready path shares the same authored terminal language without coupling
+         index.html to the loader's implementation details. */
+      body > div:has(#loadbar) {
+        background:
+          radial-gradient(ellipse at 50% 0%, rgba(219, 78, 60, .22), transparent 58%),
+          linear-gradient(135deg, #18242d, var(--ink)) !important;
+        color: var(--cream) !important;
+        font-family: 'Arial Narrow', 'Avenir Next Condensed', 'Rajdhani', system-ui, sans-serif !important;
+      }
+      body > div:has(#loadbar) > div {
+        width: min(90vw, 520px);
+        padding: 42px 48px;
+        border-top: 3px solid var(--blood);
+        border-bottom: 1px solid rgba(239, 243, 235, .2);
+        background: rgba(21, 30, 38, .96);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, .42);
+      }
+      body > div:has(#loadbar) > div > div:first-child {
+        font-size: clamp(42px, 7vw, 58px) !important;
+        line-height: .95;
+        letter-spacing: .12em !important;
+        color: var(--blood) !important;
+        text-shadow: 0 0 34px rgba(219, 78, 60, .42);
+      }
+      body > div:has(#loadbar) > div > div:nth-child(2) {
+        color: var(--amber) !important;
+        opacity: .9 !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 10px !important;
+        letter-spacing: .2em !important;
+      }
+      body > div:has(#loadbar) #loadbar {
+        background: var(--blood) !important;
+        box-shadow: 0 0 12px rgba(219, 78, 60, .55);
+      }
+      body > div:has(#loadbar) #loadstep {
+        color: rgba(239, 243, 235, .7) !important;
+        opacity: 1 !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 10px !important;
+        letter-spacing: .16em !important;
+      }
     </style>
   </head>
   <body>

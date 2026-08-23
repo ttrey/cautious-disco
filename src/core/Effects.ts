@@ -155,6 +155,7 @@ class ParticleSystem {
     // which is always preferable to dropping the newest (most visible) one.
     const i = this.cursor;
     this.cursor = (this.cursor + 1) % this.capacity;
+    const safeLife = Math.max(0.02, life);
 
     this.pos[i * 3] = x;
     this.pos[i * 3 + 1] = y;
@@ -169,8 +170,8 @@ class ParticleSystem {
     s.vx[i] = vx;
     s.vy[i] = vy;
     s.vz[i] = vz;
-    s.life[i] = life;
-    s.maxLife[i] = life;
+    s.life[i] = safeLife;
+    s.maxLife[i] = safeLife;
     s.size0[i] = size0;
     s.size1[i] = size1;
     s.gravity[i] = gravity;
@@ -182,6 +183,7 @@ class ParticleSystem {
 
   update(dt: number) {
     const s = this.state;
+    const step = clamp(dt, 0, 0.05);
     let dirtyMin = this.capacity;
     let dirtyMax = -1;
     let highestActive = -1;
@@ -189,7 +191,7 @@ class ParticleSystem {
       if (!s.active[i]) continue;
       dirtyMin = Math.min(dirtyMin, i);
       dirtyMax = i;
-      s.life[i] -= dt;
+      s.life[i] -= step;
       if (s.life[i] <= 0) {
         s.active[i] = 0;
         this.alpha[i] = 0;
@@ -197,14 +199,14 @@ class ParticleSystem {
         continue;
       }
       highestActive = i;
-      const decay = Math.max(0, 1 - s.drag[i] * dt);
+      const decay = Math.max(0, 1 - s.drag[i] * step);
       s.vx[i] *= decay;
       s.vz[i] *= decay;
-      s.vy[i] = s.vy[i] * decay + s.gravity[i] * dt;
+      s.vy[i] = s.vy[i] * decay + s.gravity[i] * step;
 
-      this.pos[i * 3] += s.vx[i] * dt;
-      this.pos[i * 3 + 1] += s.vy[i] * dt;
-      this.pos[i * 3 + 2] += s.vz[i] * dt;
+      this.pos[i * 3] += s.vx[i] * step;
+      this.pos[i * 3 + 1] += s.vy[i] * step;
+      this.pos[i * 3 + 2] += s.vz[i] * step;
 
       const t = 1 - s.life[i] / s.maxLife[i];
       this.size[i] = s.size0[i] + (s.size1[i] - s.size0[i]) * t;
@@ -218,6 +220,17 @@ class ParticleSystem {
     this.markUpdate(this.colAttribute, this.colorDirtyMin, this.colorDirtyMax, 3);
     this.colorDirtyMin = this.capacity;
     this.colorDirtyMax = -1;
+  }
+
+  /** Drops transient particles after a long background/GC stall. */
+  clear() {
+    this.state.active.fill(0);
+    this.size.fill(0);
+    this.alpha.fill(0);
+    this.geo.setDrawRange(0, 0);
+    this.posAttribute.needsUpdate = true;
+    this.sizeAttribute.needsUpdate = true;
+    this.alphaAttribute.needsUpdate = true;
   }
 
   private markUpdate(
@@ -252,12 +265,15 @@ interface Tracer {
 }
 
 const COL_SPARK = new Color(0xffb257);
+const COL_SPARK_CORE = new Color(0xffe4bd);
 const COL_BLOOD = new Color(0x6e0d0d);
 const COL_BLOOD_DARK = new Color(0x3a0606);
 const COL_SMOKE = new Color(0x6f6a63);
 const COL_PLASMA = new Color(0x62f4ff);
 const COL_PLASMA_EDGE = new Color(0x227bff);
 const COL_ARC = new Color(0xb29aff);
+const COL_SCREEN_BLOOD = new Color(0x8f1118);
+const COL_SCREEN_ENERGY = new Color(0x2f8dff);
 
 export class Effects {
   private readonly additive: ParticleSystem;
@@ -273,6 +289,16 @@ export class Effects {
   private readonly rng = new Rng(0x51ee7);
   private readonly tmp = new Vector3();
   private readonly tmp2 = new Vector3();
+  private readonly screenOffset = new Vector3();
+
+  private readonly reducedMotion =
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  private readonly detailScale = this.reducedMotion ? 0.58 : 1;
+  private screenFeedback: Mesh | null = null;
+  private screenPulse = 0;
+  private readonly screenColor = new Color(0x8f1118);
 
   private readonly holeTexture = bulletHoleTexture();
   private readonly bloodTextures = [bloodSplatTexture(0), bloodSplatTexture(1), bloodPoolTexture()];
@@ -286,7 +312,7 @@ export class Effects {
 
   /** Bullet striking world geometry. */
   impact(point: Vector3, normal: Vector3, hard: boolean) {
-    const n = hard ? 9 : 5;
+    const n = Math.max(3, Math.round((hard ? 9 : 5) * this.detailScale));
     for (let i = 0; i < n; i++) {
       // Spray into the hemisphere around the surface normal.
       this.tmp
@@ -305,8 +331,19 @@ export class Effects {
       );
     }
 
+    // A hot core keeps masonry impacts legible against the dark map even when
+    // the longer orange sparks are hidden by fog or bloom.
+    this.additive.spawn(
+      point.x, point.y, point.z,
+      normal.x * 1.8, normal.y * 1.8, normal.z * 1.8,
+      COL_SPARK_CORE,
+      0.024, 0.003,
+      0.11,
+      -4, 3.8,
+    );
+
     // Dust puff kicked off the surface.
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < Math.max(1, Math.round(4 * this.detailScale)); i++) {
       this.tmp
         .set(this.rng.range(-1, 1), this.rng.range(-1, 1), this.rng.range(-1, 1))
         .normalize()
@@ -327,7 +364,7 @@ export class Effects {
 
   /** Bullet striking a zombie. */
   bloodBurst(point: Vector3, direction: Vector3, intensity = 1) {
-    const n = Math.round(9 * intensity);
+    const n = Math.max(3, Math.round(9 * intensity * this.detailScale));
     for (let i = 0; i < n; i++) {
       this.tmp
         .copy(direction)
@@ -347,7 +384,7 @@ export class Effects {
       );
     }
     // A fine mist behind the impact reads as spray rather than as droplets.
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < Math.max(1, Math.round(4 * this.detailScale)); i++) {
       this.tmp
         .copy(direction)
         .multiplyScalar(this.rng.range(0.5, 2))
@@ -361,11 +398,13 @@ export class Effects {
         -1.5, 3.4,
       );
     }
+    this.pulseScreen(Math.min(0.045, 0.012 * intensity), COL_SCREEN_BLOOD);
   }
 
   /** Larger burst plus a ground pool, played when a zombie dies. */
   gib(point: Vector3, direction: Vector3, groundY: number) {
     this.bloodBurst(point, direction, 2.2);
+    this.pulseScreen(0.022, COL_SCREEN_BLOOD);
     this.tmp.set(point.x + this.rng.range(-0.3, 0.3), groundY + 0.012, point.z + this.rng.range(-0.3, 0.3));
     this.tmp2.set(0, 1, 0);
     this.addDecal(this.tmp, this.tmp2, this.bloodTextures[2], this.rng.range(0.5, 0.95), 34, 0.8);
@@ -429,7 +468,7 @@ export class Effects {
    * does not allocate meshes or add draw calls.
    */
   plasmaBurst(point: Vector3, intensity = 1) {
-    const n = Math.round(16 * intensity);
+    const n = Math.max(5, Math.round(16 * intensity * this.detailScale));
     for (let i = 0; i < n; i++) {
       this.tmp
         .set(this.rng.range(-1, 1), this.rng.range(-0.45, 1), this.rng.range(-1, 1))
@@ -444,6 +483,7 @@ export class Effects {
         -0.5, 2.3,
       );
     }
+    this.pulseScreen(Math.min(0.035, 0.008 * intensity), COL_SCREEN_ENERGY);
   }
 
   /**
@@ -460,7 +500,7 @@ export class Effects {
     if (side.lengthSq() < 1e-5) side.crossVectors(direction, new Vector3(1, 0, 0));
     side.normalize();
     const up = new Vector3().crossVectors(side, direction).normalize();
-    const segments = this.rng.int(4, 7);
+    const segments = this.reducedMotion ? this.rng.int(3, 4) : this.rng.int(4, 7);
     const previous = from.clone();
 
     for (let i = 1; i <= segments; i++) {
@@ -478,7 +518,7 @@ export class Effects {
 
   /** Compact electric impact, used at each successful chain link. */
   electricBurst(point: Vector3) {
-    for (let i = 0; i < 9; i++) {
+    for (let i = 0; i < Math.max(3, Math.round(9 * this.detailScale)); i++) {
       this.tmp
         .set(this.rng.range(-1, 1), this.rng.range(-0.2, 1), this.rng.range(-1, 1))
         .normalize()
@@ -492,6 +532,57 @@ export class Effects {
         -0.2, 3.1,
       );
     }
+    this.pulseScreen(0.008, COL_SCREEN_ENERGY);
+  }
+
+  private pulseScreen(amount: number, color: Color) {
+    if (this.reducedMotion) return;
+    this.screenPulse = Math.max(this.screenPulse, clamp(amount, 0, 0.06));
+    this.screenColor.copy(color);
+  }
+
+  private updateScreenFeedback(dt: number, camera?: Camera) {
+    if (!camera || this.reducedMotion) return;
+    if (!this.screenFeedback && this.screenPulse <= 0) return;
+
+    if (!this.screenFeedback) {
+      this.screenFeedback = new Mesh(
+        this.quad,
+        new MeshBasicMaterial({
+          color: this.screenColor,
+          transparent: true,
+          opacity: 0,
+          depthTest: false,
+          depthWrite: false,
+          toneMapped: false,
+          side: DoubleSide,
+        }),
+      );
+      this.screenFeedback.frustumCulled = false;
+      this.screenFeedback.renderOrder = 1000;
+      // The scope camera remains on layer 0, so a hit pulse belongs to the
+      // player's main frame and cannot appear inside an optic render target.
+      this.screenFeedback.layers.set(1);
+      this.scene.add(this.screenFeedback);
+    }
+
+    camera.layers.enable(1);
+    const perspective = camera as Camera & { aspect?: number; fov?: number };
+    const distance = 0.12;
+    const fov = ((perspective.fov ?? 72) * Math.PI) / 180;
+    const height = 2 * distance * Math.tan(fov * 0.5) * 1.06;
+    const aspect = perspective.aspect ?? 1;
+    this.screenFeedback.position.copy(camera.position);
+    this.screenFeedback.quaternion.copy(camera.quaternion);
+    this.screenOffset.set(0, 0, -distance).applyQuaternion(camera.quaternion);
+    this.screenFeedback.position.add(this.screenOffset);
+    this.screenFeedback.scale.set(height * aspect, height, 1);
+
+    const mat = this.screenFeedback.material as MeshBasicMaterial;
+    mat.color.copy(this.screenColor);
+    mat.opacity = this.screenPulse;
+    this.screenFeedback.visible = this.screenPulse > 0.001;
+    this.screenPulse = Math.max(0, this.screenPulse - dt * 0.24);
   }
 
   private addDecal(
@@ -538,6 +629,20 @@ export class Effects {
   }
 
   update(dt: number, camera?: Camera) {
+    // Engine already clamps frame time, but Effects is also used by the local
+    // preview harnesses. Do not let a background tab resurrect a cloud of stale
+    // sparks/tracers or turn a one-frame pause into a particle teleport.
+    if (dt > 0.25) {
+      this.additive.clear();
+      this.alphaBlended.clear();
+      this.smoke.clear();
+      for (const t of this.tracers) {
+        this.scene.remove(t.mesh);
+        if (this.tracerPool.length < 16) this.tracerPool.push(t.mesh);
+      }
+      this.tracers.length = 0;
+      this.screenPulse = 0;
+    }
     this.additive.update(dt);
     this.alphaBlended.update(dt);
     this.smoke.update(dt);
@@ -566,6 +671,6 @@ export class Effects {
         this.decalPool.push(d.mesh);
       }
     }
-    void camera;
+    this.updateScreenFeedback(dt, camera);
   }
 }

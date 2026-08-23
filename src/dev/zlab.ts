@@ -1,6 +1,7 @@
 import {
   ACESFilmicToneMapping,
   AmbientLight,
+  Color,
   DirectionalLight,
   Group,
   Mesh,
@@ -36,18 +37,19 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = SRGBColorSpace;
 renderer.toneMapping = ACESFilmicToneMapping;
 // Matches Engine.ts, so what looks right here looks right in the game.
-renderer.toneMappingExposure = 1.15;
+renderer.toneMappingExposure = 1.08;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = PCFShadowMap;
 document.body.appendChild(renderer.domElement);
 
 const scene = new Scene();
+scene.background = new Color(0x101820);
 scene.environment = buildEnvironment(renderer);
 scene.environmentIntensity = 0.9;
 
 const camera = new PerspectiveCamera(34, innerWidth / innerHeight, 0.01, 60);
 
-const key = new DirectionalLight(0xfff3e2, 2.4);
+const key = new DirectionalLight(0xfff3e2, 2.8);
 key.castShadow = true;
 key.shadow.mapSize.set(2048, 2048);
 key.shadow.camera.near = 0.1;
@@ -55,15 +57,27 @@ key.shadow.camera.far = 14;
 key.shadow.bias = -0.0006;
 scene.add(key);
 
-const fill = new DirectionalLight(0xc8d8ff, 1.1);
+const fill = new DirectionalLight(0xc8d8ff, 1.5);
 scene.add(fill);
 const rim = new DirectionalLight(0xbcd0ff, 1.6);
 scene.add(rim);
-scene.add(new AmbientLight(0x8894a8, 0.55));
+scene.add(new AmbientLight(0x8894a8, 0.72));
+
+// A neutral studio wall gives the face and torn-cloth silhouette a value
+// reference. The previous black void hid both material separation and the
+// layered wound in exactly the cases this harness is meant to catch.
+const backdrop = new Mesh(
+  new PlaneGeometry(18, 10),
+  new MeshStandardMaterial({ color: 0x17212a, roughness: 0.98, metalness: 0 }),
+);
+backdrop.position.set(0, 4, 2.8);
+backdrop.rotation.y = Math.PI;
+backdrop.receiveShadow = true;
+scene.add(backdrop);
 
 const floor = new Mesh(
   new PlaneGeometry(24, 24),
-  new MeshStandardMaterial({ color: 0x3a3c40, roughness: 0.95 }),
+  new MeshStandardMaterial({ color: 0x303840, roughness: 0.95 }),
 );
 floor.rotation.x = -Math.PI / 2;
 floor.receiveShadow = true;
@@ -114,10 +128,12 @@ let dist = 3;
 
 /** Camera presets. Model faces -Z, so yaw = PI looks at its front. */
 const VIEWS: Record<string, () => void> = {
-  front: () => set(0, 0.88, 0, Math.PI, 0.02, 2.9),
-  threeQuarter: () => set(0, 0.88, 0, Math.PI + 0.7, 0.06, 2.9),
-  side: () => set(0, 0.88, 0, Math.PI * 0.5, 0.02, 2.9),
-  back: () => set(0, 0.88, 0, 0, 0.02, 2.9),
+  // Keep the complete silhouette inside the fixed 34-degree review frame;
+  // 2.9 m was tight enough to clip the helmet and boots on taller variants.
+  front: () => set(0, 0.88, 0, Math.PI, 0.02, 3.25),
+  threeQuarter: () => set(0, 0.88, 0, Math.PI + 0.7, 0.06, 3.25),
+  side: () => set(0, 0.88, 0, Math.PI * 0.5, 0.02, 3.25),
+  back: () => set(0, 0.88, 0, 0, 0.02, 3.25),
   face: () => set(0, 1.63, -0.02, Math.PI, 0.0, 0.42),
   faceQuarter: () => set(0, 1.63, -0.02, Math.PI + 0.75, 0.05, 0.42),
   faceSide: () => set(0, 1.63, -0.02, Math.PI * 0.5, 0.0, 0.42),

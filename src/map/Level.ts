@@ -1,6 +1,8 @@
 import {
   BoxGeometry,
+  BufferGeometry,
   Color,
+  CylinderGeometry,
   Group,
   HemisphereLight,
   MeshBasicMaterial,
@@ -18,7 +20,17 @@ import { NavGrid } from '../core/Nav';
 import { SurfaceOptions, makeSurface } from '../assets/Materials';
 import { SurfaceId } from '../assets/TextureForge';
 import { SpawnPoint } from '../zombies/ZombieManager';
-import { Barrier, Door, Interactable, MysteryBox, PackAPunch, PerkMachine, PERKS, WallBuy } from './Props';
+import {
+  Barrier,
+  Door,
+  Interactable,
+  MysteryBox,
+  PackAPunch,
+  PerkMachine,
+  PERKS,
+  TerminalSign,
+  WallBuy,
+} from './Props';
 import { Rng, clamp } from '../util/math';
 import { mergeAll } from '../util/geometry';
 import { QualitySettings } from '../core/Quality';
@@ -165,18 +177,18 @@ const WALLS: WallSpec[] = [
   },
   // West: door into the canteen.
   {
-    x1: -7, z1: 5, x2: -7, z2: 19, height: 3.9, surface: 'plaster',
+    x1: -7, z1: 5, x2: -7, z2: 19, height: 3.9, surface: 'plaster', tint: 0xbab7ad,
     holes: [doorway(7, 2.6)], // z = 12
   },
   // East: door into the concourse. Carried up past the lobby's south wall
   // because the concourse is both taller and deeper than the lobby.
   {
-    x1: 6, z1: 5, x2: 6, z2: 21, height: 5.6, surface: 'plaster',
+    x1: 6, z1: 5, x2: 6, z2: 21, height: 5.6, surface: 'plaster', tint: 0xbab7ad,
     holes: [doorway(7, 2.6)], // z = 12
   },
   // North: wide opening through to the hall.
   {
-    x1: -7, z1: 5, x2: 6, z2: 5, height: 5.4, surface: 'plaster',
+    x1: -7, z1: 5, x2: 6, z2: 5, height: 5.4, surface: 'plaster', tint: 0xbab7ad,
     holes: [doorway(6.5, 4.2, 2.9)],
   },
 
@@ -438,8 +450,8 @@ interface LampSpec {
  */
 const LAMPS: LampSpec[] = [
   // Lobby
-  { x: 0, y: 3.2, z: 12, colour: 0xffb066, intensity: 34, range: 16 },
-  { x: -3, y: 3.2, z: 17, colour: 0xffb066, intensity: 26, range: 13 },
+  { x: 0, y: 3.2, z: 12, colour: 0xffb066, intensity: 22, range: 16 },
+  { x: -3, y: 3.2, z: 17, colour: 0xffb066, intensity: 18, range: 13 },
   // Hall
   { x: 0, y: 4.6, z: 0, colour: 0xffc48a, intensity: 62, range: 24 },
   { x: -6, y: 4.6, z: -4, colour: 0x9fc4ff, intensity: 34, range: 16 },
@@ -534,9 +546,11 @@ const APRON_HALF = 0.45;
 export class Level {
   private readonly root = new Group();
   private readonly rng = new Rng(0x1e5e1);
+  // Buckets accept any BufferGeometry: addBox contributes boxes, and the
+  // dressing pass contributes cylinders (pipes). mergeAll normalises the mix.
   private readonly geometryBuckets = new Map<
     string,
-    { mat: MeshStandardMaterial; geos: BoxGeometry[] }
+    { mat: MeshStandardMaterial; geos: BufferGeometry[] }
   >();
 
   private readonly lampLights: PointLight[] = [];
@@ -567,6 +581,11 @@ export class Level {
     for (const wall of WALLS) this.buildWall(wall, nav);
 
     this.addProps(nav);
+    // Decorative passes go through the same batcher so they merge into the
+    // scene's existing draw calls, but strictly after all gameplay geometry:
+    // they are visual-only and must never influence colliders or nav.
+    this.addGrime();
+    this.addDressing();
     this.flushGeometry();
     this.addLighting();
 
@@ -613,15 +632,23 @@ export class Level {
       nav.setCost(minX, minZ, maxX, maxZ, 2.6);
     }
 
+    // A staged interior arrival gives the opening wave a readable first beat:
+    // the player can see one silhouette through the hall doorway before the
+    // window pressure builds around the room. Later releases still use the
+    // authored barrier pockets and their repair economy.
+    spawnPoints.push({ position: new Vector3(0, 0, -1.5), zone: 'start' });
+
     const { interactables, doors } = this.addInteractables(nav);
 
     this.scene.add(this.root);
 
     // Four start points around the lobby's lamp, all clear of the three south
-    // windows so nobody is spawned into a barrier they cannot see yet.
+    // windows. The solo view is deliberately offset from the mystery box so
+    // the first frame establishes the terminal sightline instead of filling the
+    // reticle with the largest interactable prop.
     const playerSpawns = [
-      new Vector3(-2.6, 0.02, 15.4),
-      new Vector3(2.0, 0.02, 15.4),
+      new Vector3(0.8, 0.02, 15.4),
+      new Vector3(3.0, 0.02, 15.4),
       new Vector3(-2.6, 0.02, 11.6),
       new Vector3(2.0, 0.02, 11.6),
     ];
@@ -712,13 +739,97 @@ export class Level {
     return geo;
   }
 
+  /* --- Surface variation ------------------------------------------------ */
+
+  /**
+   * Quantised luminance steps for the tile-breaking pass.
+   *
+   * A single material across a 40 m floor tiles into an obviously repeating
+   * pattern — the eye locks onto the repeat within a couple of strides. These
+   * steps are deliberately *quantised* rather than continuous: every section
+   * that lands on the same step shares one material and therefore one draw
+   * call, where per-section float tints would give the map dozens of
+   * near-identical materials. Five steps at ±7% is inside the ±8% brief and
+   * still visibly distinct under the warm lamp falloff.
+   */
+  private static readonly SHADE_STEPS = [-0.07, -0.035, 0, 0.035, 0.07];
+
+  /** Multiplies a packed RGB tint by `factor`, clamped per channel. */
+  private static shadeTint(tint: number, factor: number): number {
+    const ch = (v: number) => Math.max(0, Math.min(255, Math.round(v * factor)));
+    return (ch((tint >> 16) & 0xff) << 16) | (ch((tint >> 8) & 0xff) << 8) | ch(tint & 0xff);
+  }
+
+  /**
+   * Adds a large horizontal slab (floor or ceiling) as 2–4 independently
+   * shaded, independently quarter-turned sections.
+   *
+   * Two independent axes of variation are what actually kill the repeat:
+   * luminance alone leaves the texel grid aligned across the seam, and rotation
+   * alone keeps the same contrast values marching in lockstep. Both together,
+   * with the turn index offset by the section index so two adjacent slices can
+   * never land on the same orientation even when their shade step collides,
+   * guarantees adjacent sections never show an identical texel pattern.
+   *
+   * addBox derives UVs from world size, so an odd quarter-turn must swap the
+   * box's X/Z extents to keep the footprint identical while turning the texel
+   * grid 90°; even turns rotate in place.
+   *
+   * This only slices RENDER geometry — callers keep their single physics box
+   * and nav carve exactly as before, so gameplay contracts are untouched.
+   */
+  private addSectionedSlab(
+    key: string,
+    slabSurface: SurfaceId,
+    baseTint: number,
+    centre: Vector3,
+    size: Vector3,
+    uvScale: number,
+    opts: SurfaceOptions = {},
+  ) {
+    // One slice per ~7 m of the longer axis, clamped to 2–4: the lobby gets a
+    // seam, the train shed gets four, nothing degenerates into one giant or a
+    // dozen tiny slabs.
+    const sections = Math.max(2, Math.min(4, Math.round(Math.max(size.x, size.z) / 7)));
+    // Seed from the slab's origin so the map is byte-identical run to run but
+    // neighbouring rooms do not land on the same shade sequence.
+    const rng = new Rng((0x51ab ^ Math.round(centre.x * 131) ^ Math.round(centre.z * 57)) >>> 0);
+    const alongX = size.x >= size.z;
+    for (let i = 0; i < sections; i++) {
+      const shadeIdx = rng.int(0, Level.SHADE_STEPS.length - 1);
+      // +i forces adjacent sections onto different turns.
+      const turn = (rng.int(0, 3) + i) % 4;
+      const segW = alongX ? size.x / sections : size.x;
+      const segD = alongX ? size.z : size.z / sections;
+      const cx = alongX ? centre.x - size.x / 2 + segW * (i + 0.5) : centre.x;
+      const cz = alongX ? centre.z : centre.z - size.z / 2 + segD * (i + 0.5);
+      const swap = turn % 2 === 1;
+      const segTint = Level.shadeTint(baseTint, 1 + Level.SHADE_STEPS[shadeIdx]);
+      // Suffix by BOTH indices so same-look sections merge into one batch
+      // while different-looking ones can never share a material.
+      this.addBox(
+        `${key}_s${shadeIdx}t${turn}`,
+        slabSurface,
+        segTint,
+        new Vector3(cx, centre.y, cz),
+        new Vector3(swap ? segD : segW, size.y, swap ? segW : segD),
+        uvScale,
+        (turn * Math.PI) / 2,
+        opts,
+      );
+    }
+  }
+
   private flushGeometry() {
     for (const [key, bucket] of this.geometryBuckets) {
       const merged = mergeAll(bucket.geos);
       if (!merged) continue;
       const mesh = new Mesh(merged, bucket.mat);
       mesh.name = key;
-      mesh.castShadow = true;
+      // Decorative buckets (grime overlays, cables, pipes, puddles) hug the
+      // surfaces they dress; letting them cast would double-shadow every
+      // threshold and cable for no visible gain. They still receive.
+      mesh.castShadow = !key.startsWith('deco_');
       mesh.receiveShadow = true;
       this.root.add(mesh);
       bucket.geos.forEach((g) => g.dispose());
@@ -775,18 +886,31 @@ export class Level {
     const cx = (room.minX + room.maxX) / 2;
     const cz = (room.minZ + room.maxZ) / 2;
 
-    this.addBox(
-      `floor_${room.floor}_${room.floorTint ?? 0}`,
+    const floorTint = room.floorTint ?? (room.floor === 'tile' ? 0x817a73 : 0xffffff);
+    const floorSurface: SurfaceOptions = room.floor === 'tile'
+      ? { roughness: 0.94, metalness: 0.02, normalScale: 0.28, aoIntensity: 0.78 }
+      : { roughness: 0.96, metalness: 0.02, normalScale: 0.45, aoIntensity: 0.82 };
+    // Floor: split into shade/rotation-varied sections so a whole room of one
+    // material doesn't read as wallpaper (see addSectionedSlab). The physics
+    // box below stays the single full-size collider it always was — only the
+    // render geometry is sliced.
+    this.addSectionedSlab(
+      `floor_${room.floor}_${floorTint}`,
       room.floor,
-      room.floorTint ?? 0xffffff,
+      floorTint,
       new Vector3(cx, -0.15, cz),
       new Vector3(w, 0.3, d),
-      room.floor === 'tile' ? 0.42 : 0.6,
+      // The baked tile is an 8x8 cell texture; this keeps each cell close to
+      // half a metre so the lobby reads as a worn terminal floor, not noise.
+      room.floor === 'tile' ? 0.24 : 0.6,
+      floorSurface,
     );
     this.physics.addStaticBox(new Vector3(cx, -0.15, cz), new Vector3(w / 2, 0.15, d / 2));
 
     if (room.ceiling !== false) {
-      this.addBox(
+      // Same treatment as the floor: ceilings are the largest uninterrupted
+      // surface in every interior shot and repeated the hardest.
+      this.addSectionedSlab(
         'ceiling',
         'concrete',
         0x6a6862,
@@ -830,6 +954,14 @@ export class Level {
     if (cursor < length) segments.push({ start: cursor, end: length, bottom: 0, top: spec.height });
 
     const tint = spec.tint ?? 0xffffff;
+    // Per-segment shade ladder, seeded from the wall's start point: every wall
+    // gets its own deterministic sequence, and the +segIndex offset guarantees
+    // neighbouring segments (the slabs between holes) never land on the same
+    // step — a wall pierced by three doors reads as three pours of concrete,
+    // not one texture stamped three times. Quantised so segments across the
+    // whole map still share a handful of materials.
+    const wallRng = new Rng((0x77aa ^ Math.round(spec.x1 * 97) ^ Math.round(spec.z1 * 31)) >>> 0);
+    let segIndex = 0;
     for (const seg of segments) {
       const segLength = seg.end - seg.start;
       if (segLength < 1e-3) continue;
@@ -841,12 +973,15 @@ export class Level {
       );
       const size = new Vector3(WALL_THICKNESS, seg.top - seg.bottom, segLength);
 
-      this.addBox(`wall_${spec.surface}_${tint}`, spec.surface, tint, centre, size, 0.85, yaw);
+      const shadeIdx = (wallRng.int(0, Level.SHADE_STEPS.length - 1) + segIndex) % Level.SHADE_STEPS.length;
+      const segTint = Level.shadeTint(tint, 1 + Level.SHADE_STEPS[shadeIdx]);
+      this.addBox(`wall_${spec.surface}_${segTint}`, spec.surface, segTint, centre, size, 0.85, yaw);
       this.physics.addStaticBox(
         centre,
         new Vector3(size.x / 2, size.y / 2, size.z / 2),
         new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), yaw),
       );
+      segIndex++;
     }
 
     if (spec.passable) return;
@@ -916,9 +1051,424 @@ export class Level {
     const CRATE = 'prop_crate';
     const DRUM = 'prop_drum';
     const STEEL = 'prop_steel';
-    const PAINT = 'prop_paint';
+    const PAINT = 'paintedMetal';
     const CONCRETE = 'prop_concrete';
     const wood: SurfaceOptions = { normalScale: 1 };
+
+    const addSign = (
+      title: string,
+      subtitle: string,
+      position: Vector3,
+      yaw: number,
+      options: { width?: number; height?: number; accent?: number } = {},
+    ) => {
+      // Signage is wall-mounted and intentionally has no physics/nav footprint.
+      this.root.add(new TerminalSign(title, subtitle, position, yaw, options).root);
+    };
+
+    /* --- Spawn arrival composition ------------------------------------
+     *
+     * The lobby is the first image of the map, so it needs a readable arrival
+     * axis rather than a loose collection of machines. The header frames the
+     * hall opening, while the dais, hazard inlay and low baggage cover give the
+     * free starting room a deliberate centre without closing its four-player
+     * spawn lanes.
+     */
+    // Keep the header below the lobby ceiling so the first arrival landmark is
+    // actually visible from the player spawn rather than hidden in the slab.
+    addSign('ASHGATE TERMINAL', 'PLATFORM 01 // MAIN HALL', new Vector3(-0.5, 2.34, 5.40), Math.PI, {
+      width: 4.9,
+      height: 1.15,
+      accent: 0xffb66e,
+    });
+    this.addBox(
+      'arrival_header', 'rustedMetal', 0x625e57,
+      new Vector3(-0.5, 3.16, 5.40), new Vector3(7.0, 0.22, 0.3), 1.2,
+      0, { roughness: 0.72, metalness: 0.9 },
+    );
+    for (const x of [-6.6, 5.6]) {
+      this.addBox(
+        'arrival_jamb', 'rustedMetal', 0x6f6b62,
+        new Vector3(x, 1.52, 5.22), new Vector3(0.22, 3.05, 0.32), 1.6,
+        0, { roughness: 0.7, metalness: 0.85 },
+      );
+    }
+    // Thin emergency strips are emissive practicals, not new live lights: they
+    // remain readable at distance without increasing the active-light budget.
+    for (const x of [-6.66, 5.66]) {
+      this.addBox(
+        'arrival_emergency_strip', 'paintedMetal', 0x7c2e28,
+        new Vector3(x, 2.58, 5.02), new Vector3(0.045, 0.085, 0.42), 1,
+        0, { emissive: 0xf04c32, emissiveIntensity: 0.9, roughness: 0.55, metalness: 0.3 },
+      );
+    }
+    addSign('ARRIVALS', 'CENTRAL LOBBY // 06:40', new Vector3(5.78, 2.18, 12.15), Math.PI / 2, {
+      width: 2.65,
+      height: 0.82,
+      accent: 0x79d4c2,
+    });
+    addSign('HALL 01', 'MAIN CONCOURSE // NORTH', new Vector3(-6.78, 2.18, 9.55), -Math.PI / 2, {
+      width: 2.45,
+      height: 0.76,
+      accent: 0xffb66e,
+    });
+    // The first sightline needs a readable ceiling rhythm. These are meshes,
+    // not extra point lights: the existing lamp rig supplies illumination while
+    // the visible fixture bodies provide scale and a believable source for it.
+    for (const [z, glow] of [[7.6, 0xffc08a], [12.1, 0xffd7a0], [16.6, 0x9fcaff]] as [number, number][]) {
+      this.addBox(
+        'lobby_fixture_frame', 'paintedMetal', 0x3e4549,
+        new Vector3(0, 3.47, z), new Vector3(2.8, 0.08, 0.46), 1.2,
+        0, { roughness: 0.72, metalness: 0.25, normalScale: 0.4 },
+      );
+      this.addBox(
+        'lobby_fixture_glow', 'paintedMetal', glow,
+        new Vector3(0, 3.42, z), new Vector3(2.18, 0.025, 0.2), 1.2,
+        0, { emissive: glow, emissiveIntensity: 0.28, roughness: 0.3, metalness: 0.02 },
+      );
+    }
+    // A low split wainscot makes the doorway read as architecture and keeps
+    // the long plaster wall from presenting as one unbroken procedural slab.
+    for (const [x, width] of [[-4.55, 4.35], [4.55, 3.55]] as [number, number][]) {
+      this.addBox(
+        'lobby_wainscot', 'paintedMetal', 0x4e5a5c,
+        new Vector3(x, 0.78, 5.07), new Vector3(width, 1.28, 0.055), 0.8,
+        0, { roughness: 0.86, metalness: 0.22, normalScale: 0.55 },
+      );
+      this.addBox(
+        'lobby_wainscot_rail', 'rustedMetal', 0x716658,
+        new Vector3(x, 1.48, 5.02), new Vector3(width + 0.08, 0.07, 0.12), 1.2,
+        0, { roughness: 0.72, metalness: 0.72, normalScale: 0.45 },
+      );
+    }
+    // A small platform and four painted corner marks sell the mystery box as a
+    // fitted terminal fixture. They are visual-only because the box already owns
+    // the interaction collider and nav seal below.
+    this.addBox(
+      'arrival_dais', 'concrete', 0x555d58,
+      new Vector3(-2.6, 0.07, 13.4), new Vector3(2.75, 0.14, 2.1), 0.8,
+    );
+    for (const [x, z, sx, sz] of [
+      [-3.82, 13.4, 0.08, 1.9], [-1.38, 13.4, 0.08, 1.9],
+      [-2.6, 12.5, 2.35, 0.08], [-2.6, 14.3, 2.35, 0.08],
+    ] as [number, number, number, number][]) {
+      this.addBox(
+        'arrival_hazard_mark', 'paintedMetal', 0xb57d42,
+        new Vector3(x, 0.16, z), new Vector3(sx, 0.035, sz), 1.5,
+        0, { emissive: 0x8b3b1c, emissiveIntensity: 0.18, roughness: 0.68, metalness: 0.35 },
+      );
+    }
+    this.block(
+      'arrival_luggage', PAINT, 0x55666a,
+      new Vector3(3.85, 0.44, 8.8), new Vector3(1.35, 0.88, 0.9), 1.1, 0, nav,
+      { roughness: 0.78, metalness: 0.85 },
+    );
+    this.addBox(
+      'arrival_luggage_top', 'gunmetal', 0x86847b,
+      new Vector3(3.85, 0.91, 8.8), new Vector3(1.5, 0.08, 1.02), 1.2,
+      0, { roughness: 0.6, metalness: 0.95 },
+    );
+    // Surface-mounted hand rails add scale and decay to the long lobby walls;
+    // they sit inside the existing wall collision band and never alter nav.
+    for (const x of [-6.72, 5.72]) {
+      this.addBox(
+        'arrival_wall_rail', 'rustedMetal', 0x69645c,
+        new Vector3(x, 1.18, 9.2), new Vector3(0.08, 0.08, 5.0), 1.4,
+        0, { roughness: 0.76, metalness: 0.86 },
+      );
+      for (const z of [7.0, 11.4]) {
+        this.addBox(
+          'arrival_wall_rail_bracket', 'rustedMetal', 0x4f4c48,
+          new Vector3(x, 1.18, z), new Vector3(0.2, 0.16, 0.12), 1.4,
+          0, { roughness: 0.78, metalness: 0.9 },
+        );
+      }
+    }
+
+    /* --- Lobby construction pass --------------------------------------
+     *
+     * These are deliberately render-only layers. The room and wall specs above
+     * remain the authority for traversal; the shallow panels, trims, conduits
+     * and debris only give the existing shell the visual construction a player
+     * reads at eye level. The north opening is the first zombie approach, so it
+     * gets the strongest authored rhythm and a clean visual frame.
+     */
+    const panelSurface: SurfaceOptions = {
+      roughness: 0.9,
+      metalness: 0.24,
+      normalScale: 0.65,
+    };
+    const trimSurface: SurfaceOptions = {
+      roughness: 0.72,
+      metalness: 0.78,
+      normalScale: 0.45,
+    };
+
+    // Wainscot modules on both long side walls. Varying the panel widths keeps
+    // the lobby from reading as one repeated texture while the rails establish
+    // a believable terminal kick-plate line behind the weapon viewmodel.
+    for (const [x, side] of [[-6.79, -1], [5.79, 1]] as [number, number][]) {
+      this.addBox(
+        'lobby_side_wainscot_rail', 'rustedMetal', 0x6e665b,
+        new Vector3(x, 1.5, 12.1), new Vector3(0.075, 0.08, 12.7), 1.3,
+        0, trimSurface,
+      );
+      for (const [z, depth] of [[6.55, 2.1], [9.25, 2.45], [12.35, 2.7], [15.55, 2.35], [18.05, 1.35]] as [number, number][]) {
+        this.addBox(
+          'lobby_side_panel', 'paintedMetal', side < 0 ? 0x536064 : 0x4c595d,
+          new Vector3(x + side * 0.012, 0.78, z), new Vector3(0.055, 1.28, depth), 0.72,
+          0, panelSurface,
+        );
+        this.addBox(
+          'lobby_side_panel_cap', 'rustedMetal', 0x776c5e,
+          new Vector3(x + side * 0.045, 1.47, z), new Vector3(0.095, 0.07, depth + 0.06), 1.1,
+          0, trimSurface,
+        );
+      }
+    }
+
+    // A proper portal casing makes the hall feel built into the terminal. The
+    // posts sit just outside the 4.2 m opening and do not narrow its collider.
+    for (const x of [-2.92, 1.92]) {
+      this.addBox(
+        'hall_portal_pilaster', 'concrete', 0x77736c,
+        new Vector3(x, 1.55, 4.78), new Vector3(0.24, 3.1, 0.48), 0.9,
+        0, { roughness: 0.9, metalness: 0.12, normalScale: 0.8 },
+      );
+      this.addBox(
+        'hall_portal_pilaster_trim', 'rustedMetal', 0x686057,
+        new Vector3(x, 1.55, 4.48), new Vector3(0.32, 3.22, 0.09), 1.0,
+        0, trimSurface,
+      );
+    }
+    this.addBox(
+      'hall_portal_lintel', 'concrete', 0x817a70,
+      new Vector3(-0.5, 3.15, 4.78), new Vector3(5.1, 0.28, 0.48), 0.9,
+      0, { roughness: 0.88, metalness: 0.1, normalScale: 0.78 },
+    );
+    this.addBox(
+      'hall_portal_lintel_trim', 'rustedMetal', 0x696057,
+      new Vector3(-0.5, 2.96, 4.48), new Vector3(5.25, 0.09, 0.1), 1.1,
+      0, trimSurface,
+    );
+    // A thin amber threshold line gives the player a destination without
+    // placing a bright decal or prompt in the crosshair.
+    for (const x of [-2.38, 1.38]) {
+      this.addBox(
+        'hall_portal_threshold', 'paintedMetal', 0xa37248,
+        new Vector3(x, 0.025, 5.7), new Vector3(0.075, 0.035, 1.35), 1.4,
+        0, { emissive: 0x4a2415, emissiveIntensity: 0.16, roughness: 0.7, metalness: 0.38 },
+      );
+    }
+
+    // The lobby ceiling is a single slab by design; shallow service beams turn
+    // it into a believable suspended structure and give the warm fixtures a
+    // repeatable architectural cadence without adding lights or collisions.
+    for (const z of [6.1, 9.55, 13.15, 16.75, 18.55]) {
+      this.addBox(
+        'lobby_ceiling_crossbeam', 'rustedMetal', 0x44484a,
+        new Vector3(0, 3.48, z), new Vector3(12.1, 0.12, 0.16), 1.15,
+        0, { roughness: 0.82, metalness: 0.72, normalScale: 0.38 },
+      );
+    }
+    for (const x of [-5.55, 5.55]) {
+      this.addBox(
+        'lobby_ceiling_service_rail', 'rustedMetal', 0x505154,
+        new Vector3(x, 3.42, 12.1), new Vector3(0.16, 0.14, 12.7), 1.1,
+        0, { roughness: 0.8, metalness: 0.78, normalScale: 0.38 },
+      );
+    }
+    for (const z of [3.2, -0.4, -4.0]) {
+      this.addBox(
+        'hall_ceiling_joist', 'rustedMetal', 0x4c4d4d,
+        new Vector3(-0.5, 5.02, z), new Vector3(16.0, 0.16, 0.22), 1.05,
+        0, { roughness: 0.82, metalness: 0.74, normalScale: 0.38 },
+      );
+    }
+
+    // Boarded hall windows now have a real masonry reveal: posts, sill and
+    // lintel make the existing barrier planks read as a barricade in a wall,
+    // rather than two floating dark rectangles at the end of the hall.
+    for (const x of [-3.5, 2.5]) {
+      for (const offset of [-0.92, 0.92]) {
+        this.addBox(
+          'hall_boarded_window_post', 'rustedMetal', 0x655b50,
+          new Vector3(x + offset, 1.6, -6.77), new Vector3(0.1, 1.65, 0.12), 1.1,
+          0, trimSurface,
+        );
+      }
+      this.addBox(
+        'hall_boarded_window_lintel', 'rustedMetal', 0x655b50,
+        new Vector3(x, 2.42, -6.77), new Vector3(1.95, 0.1, 0.12), 1.1,
+        0, trimSurface,
+      );
+      this.addBox(
+        'hall_boarded_window_sill', 'concrete', 0x5b5752,
+        new Vector3(x, 0.82, -6.77), new Vector3(1.95, 0.13, 0.16), 0.9,
+        0, { roughness: 0.94, metalness: 0.1, normalScale: 0.8 },
+      );
+      for (const offset of [-0.44, 0.44]) {
+        this.addBox(
+          'hall_boarded_window_bracket', 'rustedMetal', 0x8a684d,
+          new Vector3(x + offset, 1.54, -6.69), new Vector3(0.16, 0.12, 0.08), 1.2,
+          0, trimSurface,
+        );
+      }
+    }
+
+    // Exposed conduits and a service junction break up the hall side walls and
+    // carry the eye toward the windows without changing the training lane.
+    for (const x of [-8.72, 7.72]) {
+      this.addBox(
+        'hall_wall_conduit', 'rustedMetal', 0x55534f,
+        new Vector3(x, 2.8, -0.85), new Vector3(0.09, 0.09, 8.1), 1.3,
+        0, trimSurface,
+      );
+      for (const z of [-4.6, -1.0, 2.7]) {
+        this.addBox(
+          'hall_wall_conduit_bracket', 'rustedMetal', 0x6b5d50,
+          new Vector3(x, 2.8, z), new Vector3(0.2, 0.17, 0.12), 1.2,
+          0, trimSurface,
+        );
+      }
+    }
+    this.addBox(
+      'hall_service_junction', 'paintedMetal', 0x59666a,
+      new Vector3(7.73, 2.48, 3.25), new Vector3(0.12, 0.62, 0.74), 0.85,
+      0, panelSurface,
+    );
+    this.addBox(
+      'hall_service_junction_label', 'paintedMetal', 0xd09052,
+      new Vector3(7.80, 2.51, 3.25), new Vector3(0.025, 0.22, 0.42), 1.1,
+      0, { emissive: 0x4a2413, emissiveIntensity: 0.18, roughness: 0.56, metalness: 0.28 },
+    );
+
+    // Small, non-blocking decay clusters live against the wall edges. Their
+    // low profile supplies the missing lived-in scale while leaving every
+    // authored spawn lane and collider untouched.
+    for (const [x, z, yaw] of [[-5.92, 7.0, 0.22], [5.38, 16.9, -0.32], [-6.0, 17.65, 0.48]] as [number, number, number][]) {
+      this.addBox(
+        'lobby_floor_debris', 'concrete', 0x4e4b47,
+        new Vector3(x, 0.035, z), new Vector3(0.46, 0.07, 0.18), 1.4,
+        yaw, { roughness: 0.98, metalness: 0.04, normalScale: 0.95 },
+      );
+      this.addBox(
+        'lobby_floor_debris_edge', 'rustedMetal', 0x795740,
+        new Vector3(x + 0.18, 0.055, z - 0.06), new Vector3(0.22, 0.035, 0.06), 1.5,
+        yaw + 0.16, trimSurface,
+      );
+    }
+    for (const [x, z, y, h, w] of [[-6.80, 8.35, 2.0, 0.72, 0.44], [5.80, 14.15, 2.3, 0.58, 0.68], [5.80, 18.0, 1.1, 0.92, 0.3]] as [number, number, number, number, number][]) {
+      this.addBox(
+        'lobby_plaster_failure', 'concrete', 0x665b54,
+        new Vector3(x, y, z), new Vector3(0.035, h, w), 0.7,
+        0, { roughness: 0.97, metalness: 0.04, normalScale: 1.0 },
+      );
+    }
+
+    /* --- Terminal joinery and service wear ---------------------------
+     *
+     * The shell above establishes the silhouette. These low-profile layers
+     * are the construction language that makes it read as a maintained-but-
+     * abandoned public building: a kick plate at the floor, a shadowed
+     * surround at each side entrance, and a real material break at the hall
+     * threshold. They are render-only and stay inside the existing wall band,
+     * so physics, nav and every authored spawn lane remain unchanged.
+     */
+    for (const [x, side] of [[-6.79, -1], [5.79, 1]] as [number, number][]) {
+      this.addBox(
+        'lobby_wall_plinth', 'concrete', 0x575a57,
+        new Vector3(x, 0.18, 12.05), new Vector3(0.07, 0.34, 12.85), 0.72,
+        0, { roughness: 0.96, metalness: 0.12, normalScale: 0.82 },
+      );
+      this.addBox(
+        'lobby_wall_plinth_cap', 'rustedMetal', 0x766d61,
+        new Vector3(x + side * 0.045, 0.38, 12.05), new Vector3(0.09, 0.06, 12.92), 1.2,
+        0, trimSurface,
+      );
+
+      // The real side door openings are at z=12. The dark inner reveal and
+      // bright outer trim give the openings depth without narrowing them.
+      for (const z of [10.56, 13.44]) {
+        this.addBox(
+          'lobby_side_door_reveal', 'concrete', 0x4d5353,
+          new Vector3(x + side * 0.015, 1.52, z), new Vector3(0.055, 3.0, 0.14), 0.82,
+          0, { roughness: 0.94, metalness: 0.1, normalScale: 0.75 },
+        );
+        this.addBox(
+          'lobby_side_door_trim', 'rustedMetal', 0x746a5d,
+          new Vector3(x + side * 0.055, 1.52, z), new Vector3(0.08, 3.12, 0.08), 1.05,
+          0, trimSurface,
+        );
+      }
+      this.addBox(
+        'lobby_side_door_lintel', 'concrete', 0x6c6a64,
+        new Vector3(x + side * 0.015, 3.08, 12), new Vector3(0.06, 0.16, 2.98), 0.88,
+        0, { roughness: 0.9, metalness: 0.1, normalScale: 0.7 },
+      );
+      this.addBox(
+        'lobby_side_door_lintel_trim', 'rustedMetal', 0x806c57,
+        new Vector3(x + side * 0.06, 2.96, 12), new Vector3(0.08, 0.07, 3.08), 1.1,
+        0, trimSurface,
+      );
+    }
+
+    // Tile gives way to the hall's worn concrete through a dark stone sill;
+    // the existing amber safety marks sit on top of this transition.
+    this.addBox(
+      'hall_floor_transition', 'concrete', 0x625f59,
+      new Vector3(-0.5, 0.018, 5.08), new Vector3(4.18, 0.035, 0.3), 0.9,
+      0, { roughness: 0.98, metalness: 0.08, normalScale: 0.9 },
+    );
+    for (const x of [-2.15, -1.05, 0.05, 1.15]) {
+      this.addBox(
+        'hall_floor_transition_inlay', 'rustedMetal', 0x8b6c4c,
+        new Vector3(x, 0.043, 5.08), new Vector3(0.035, 0.018, 0.24), 1.1,
+        0, { roughness: 0.72, metalness: 0.72, normalScale: 0.4 },
+      );
+    }
+
+    // Compact service boxes make the wall dressing functional rather than
+    // decorative. Their tiny face strips are emissive meshes only; no live
+    // lights are added to the scene.
+    for (const [x, side, z, tint] of [
+      [-6.79, -1, 7.35, 0xc24d35],
+      [5.79, 1, 16.85, 0x78b8b0],
+    ] as [number, number, number, number][]) {
+      this.addBox(
+        'lobby_service_box', 'paintedMetal', 0x3e484b,
+        new Vector3(x + side * 0.015, 1.9, z), new Vector3(0.1, 0.58, 0.58), 0.8,
+        0, { roughness: 0.78, metalness: 0.7, normalScale: 0.45 },
+      );
+      this.addBox(
+        'lobby_service_box_face', 'paintedMetal', tint,
+        new Vector3(x + side * 0.075, 1.9, z), new Vector3(0.025, 0.24, 0.32), 1.0,
+        0, { emissive: tint, emissiveIntensity: 0.18, roughness: 0.62, metalness: 0.32 },
+      );
+      this.addBox(
+        'lobby_service_box_latch', 'rustedMetal', 0x9a8061,
+        new Vector3(x + side * 0.08, 1.9, z - 0.2), new Vector3(0.03, 0.06, 0.08), 1.1,
+        0, trimSurface,
+      );
+    }
+
+    // A shallow patch and its exposed edge make the plaster failure read as a
+    // layered repair, not a single dark decal pasted onto the wall.
+    for (const [x, side, z, width] of [
+      [-6.79, -1, 10.05, 0.72],
+      [5.79, 1, 14.95, 0.86],
+    ] as [number, number, number, number][]) {
+      this.addBox(
+        'lobby_wall_repair_patch', 'plaster', 0x8f877d,
+        new Vector3(x + side * 0.018, 2.36, z), new Vector3(0.035, 0.46, width), 0.72,
+        0, { roughness: 0.98, metalness: 0.02, normalScale: 0.9 },
+      );
+      this.addBox(
+        'lobby_wall_repair_edge', 'concrete', 0x5f5952,
+        new Vector3(x + side * 0.045, 2.36, z - width * 0.42), new Vector3(0.045, 0.5, 0.035), 0.75,
+        0, { roughness: 0.98, metalness: 0.04, normalScale: 0.95 },
+      );
+    }
 
     // --- Crate stacks: cover, and a scale reference in the big rooms. -----
     const crateSpots: [number, number, number][] = [
@@ -1155,6 +1705,53 @@ export class Level {
       CONCRETE, 'concrete', 0x9a958c,
       new Vector3(2, 0.11, -30.4), new Vector3(44, 0.22, 0.5), 0.9,
     );
+    addSign('PLATFORM 01', 'ASHGATE // ARRIVALS', new Vector3(0, 5.88, -39.78), Math.PI, {
+      width: 5.6,
+      height: 1.15,
+      accent: 0x8fc6df,
+    });
+    // Overhead shed trusses make the roof volume legible from the floor. They
+    // are well above the player and therefore decorative rather than traversable
+    // geometry, while the existing columns remain the actual cover/collision.
+    for (const z of [-25, -31.5, -38]) {
+      this.addBox(
+        'shed_overhead_truss', 'rustedMetal', 0x55534f,
+        new Vector3(2, 7.86, z), new Vector3(43.2, 0.18, 0.24), 1.1,
+        0, { roughness: 0.78, metalness: 0.9 },
+      );
+    }
+    for (const x of [-17, -3, 11, 20]) {
+      this.addBox(
+        'shed_roof_brace', 'rustedMetal', 0x4c4a47,
+        new Vector3(x, 7.5, -31.5), new Vector3(0.18, 0.75, 13.0), 1.0,
+        0, { roughness: 0.82, metalness: 0.88 },
+      );
+    }
+
+    // --- Landmark signage and industrial wear --------------------------
+    addSign('LOADING YARD', 'BAY 04 // KEEP CLEAR', new Vector3(34.78, 3.72, 13.2), Math.PI / 2, {
+      width: 3.7,
+      height: 0.98,
+      accent: 0xffa05c,
+    });
+    addSign('SIGNAL 09', 'CONTROL ROOM // DEAD END', new Vector3(0, 2.35, -51.78), Math.PI, {
+      width: 3.6,
+      height: 0.92,
+      accent: 0x9a5cff,
+    });
+    // Paint failure and patch plates keep the long lobby/concourse walls from
+    // reading as untouched procedural slabs. These overlap the existing walls
+    // by only a few centimetres and add no separate collider.
+    this.addBox(
+      'spawn_decay_patch', 'concrete', 0x6b5d54,
+      new Vector3(5.79, 1.28, 16.4), new Vector3(0.035, 1.55, 0.9), 0.8,
+      0, { roughness: 0.94, metalness: 0.15, normalScale: 0.9 },
+    );
+    this.addBox(
+      'platform_decay_patch', 'concrete', 0x5b504d,
+      new Vector3(-19.78, 2.55, -29.5), new Vector3(0.035, 2.1, 1.0), 0.7,
+      0, { roughness: 0.96, metalness: 0.12, normalScale: 0.95 },
+    );
 
     // --- Signal box: console banks and a lever frame. ---------------------
     for (const x of [-5.2, 5.2]) {
@@ -1167,6 +1764,404 @@ export class Level {
       STEEL, 'rustedMetal', 0x6f6a60,
       new Vector3(-4, 0.5, -43), new Vector3(4.0, 1.0, 0.7), 1.6, 0, nav,
     );
+  }
+
+  /* --- Grime and dressing ------------------------------------------------ */
+
+  /**
+   * Which floor surface lies under a world point.
+   *
+   * Grime has to inherit the surface it darkens — a tile-textured stain on a
+   * concrete floor would read as a decal floating on the wrong material. Rooms
+   * are the only authored floor geometry, so anything outside them (the service
+   * court, the yard, the forecourt) sits on the exterior asphalt slab.
+   */
+  private floorSurfaceAt(x: number, z: number): SurfaceId {
+    for (const room of ROOMS) {
+      if (x >= room.minX && x <= room.maxX && z >= room.minZ && z <= room.maxZ) return room.floor;
+    }
+    return 'asphalt';
+  }
+
+  /**
+   * One thin dark overlay pad on the floor.
+   *
+   * These anchor the traffic paths: a doorway or window approach that stays
+   * visibly darker than the surrounding floor tells the player where the horde
+   * comes from without a single UI element. The pad is the *existing* surface
+   * id crushed to near-black rather than a new material, so it inherits the
+   * floor's own texture response and just reads as worn-in dirt. It floats
+   * +0.005 above the floor's top face (box spans 0.005–0.015) — close enough
+   * that no step is visible, far enough that the shared plane never z-fights.
+   */
+  private addGrimePad(
+    surface: SurfaceId,
+    centre: Vector3,
+    through: number,
+    across: number,
+    yaw: number,
+  ): void {
+    this.addBox(
+      `deco_grime_${surface}`,
+      surface,
+      0x3a3a3a,
+      new Vector3(centre.x, 0.01, centre.z),
+      new Vector3(through, 0.01, across),
+      0.5,
+      yaw,
+      { normalScale: 0.35 },
+    );
+  }
+
+  /**
+   * Threshold and window grime.
+   *
+   * Doorway centres mirror the `doorway(...)` holes in WALLS and the window
+   * pads mirror BARRIERS. They are deliberately re-stated here instead of being
+   * derived at compile time: this pass is purely decorative, and keeping it
+   * read-only against the gameplay data means it can never perturb a collider,
+   * a nav cell or a spawn — worst case a stain sits in the wrong place.
+   */
+  private addGrime(): void {
+    // [centre x, centre z, through-axis, width of the opening]
+    const doorways: [number, number, 'x' | 'z', number][] = [
+      [-7, 12, 'x', 2.6], // lobby <-> canteen
+      [6, 12, 'x', 2.6], // lobby <-> concourse
+      [-0.5, 5, 'z', 4.2], // lobby <-> hall (wide opening)
+      [-9, -0.5, 'x', 2.6], // hall <-> plant
+      [8, -1, 'x', 2.8], // hall <-> warehouse
+      [-17, 5, 'z', 2.6], // canteen <-> plant
+      [14, 5, 'z', 2.8], // concourse <-> warehouse
+      [24, 12, 'x', 2.8], // concourse <-> yard
+      [24, -5.5, 'x', 3.0], // warehouse <-> yard
+      [12.5, -16, 'z', 3.0], // warehouse <-> corridor
+      [-13, -16, 'z', 3.0], // plant <-> corridor
+      [-14, -22, 'z', 3.0], // corridor <-> train shed
+      [24, -28, 'x', 3.0], // yard <-> train shed
+      [0, -40, 'z', 3.0], // train shed <-> signal box
+    ];
+    for (const [x, z, axis, w] of doorways) {
+      // The strip runs *through* the doorway (both sides of the wall line) and
+      // oversails the frame slightly, because feet scuff wider than doors.
+      const through = 2.3;
+      const across = w + 0.9;
+      this.addGrimePad(
+        this.floorSurfaceAt(x, z),
+        new Vector3(x, 0, z),
+        axis === 'x' ? through : across,
+        axis === 'x' ? across : through,
+        axis === 'x' ? 0 : Math.PI / 2,
+      );
+    }
+
+    // One dark apron on the room side of every boarded window: zombies pour
+    // through these for the whole run, so the approach should look it.
+    for (const b of BARRIERS) {
+      const dx = b.x - b.spawn[0];
+      const dz = b.z - b.spawn[1];
+      const len = Math.hypot(dx, dz) || 1;
+      const nx = dx / len;
+      const nz = dz / len;
+      // Local +X is rotated onto the inward direction (atan2(-dz, dx)), so the
+      // pad's long axis always lies across the traffic lane regardless of the
+      // wall's orientation.
+      this.addGrimePad(
+        this.floorSurfaceAt(b.x + nx * 1.15, b.z + nz * 1.15),
+        new Vector3(b.x + nx * 1.15, 0, b.z + nz * 1.15),
+        1.7,
+        2.7,
+        Math.atan2(-nz, nx),
+      );
+    }
+  }
+
+  /**
+   * Purely decorative set dressing: ceiling cable runs with catenary sag and
+   * junction boxes, bracketed pipe runs in two corridors, and glossy dark
+   * puddle patches near three doorways.
+   *
+   * Everything here lives in `deco_` buckets, which flushGeometry marks
+   * castShadow=false (they hug real surfaces; their shadows would only double
+   * shadow the geometry they sit against) but receiveShadow=true. Nothing in
+   * this method adds a collider, blocks nav, or touches a spawn — dressing
+   * hangs above head height against walls/ceilings or lies 1 cm thick on the
+   * floor inside already-walkable space. Total added triangle count is ~2k,
+   * well under the 15k budget.
+   */
+  private addDressing(): void {
+    const rng = new Rng(0xd05e5 >>> 0);
+
+    /* Ceiling cable runs: chain that room's fixtures together. Sag follows a
+     * parabola (4·s·t·(1−t), max s at midspan) which is visually identical to
+     * a catenary at these scales and needs no trig per segment. Segments are
+     * short overlapping boxes — one merged batch, trivially cheap, and they
+     * catch the lamp light along their length like a real dropped line. */
+    const cableChains: { cy: number; pts: [number, number][] }[] = [
+      // The three start-adjacent rooms get runs too: they are what every
+      // first frame and every early-round screenshot actually looks at.
+      { cy: 3.6 - 0.18, pts: [[0, 12], [-3, 17]] }, // lobby
+      { cy: 3.9 - 0.18, pts: [[-19, 9], [-12, 15]] }, // canteen
+      { cy: 5.6 - 0.18, pts: [[11, 9], [19, 17]] }, // concourse
+      { cy: 5.4 - 0.18, pts: [[0, 0], [-6, -4]] }, // hall
+      { cy: 6.2 - 0.18, pts: [[16, -2], [13, -13]] }, // warehouse
+      { cy: 4.2 - 0.18, pts: [[-16, -6], [-19, -13], [-13, 2]] }, // plant
+      { cy: 3.4 - 0.18, pts: [[-14, -19], [0, -19], [14, -19]] }, // service corridor
+      { cy: 8.5 - 0.18, pts: [[-10, -25], [10, -25], [14, -37], [-8, -37]] }, // train shed
+    ];
+    for (const chain of cableChains) {
+      for (let p = 0; p < chain.pts.length; p++) {
+        const [px, pz] = chain.pts[p];
+        // Junction box where each run meets its fixture.
+        this.addBox(
+          'deco_jbox',
+          'gunmetal',
+          0x34373a,
+          new Vector3(px, chain.cy, pz),
+          new Vector3(0.26, 0.16, 0.18),
+          0.6,
+          rng.range(0, Math.PI),
+          { roughness: 0.7, metalness: 0.55 },
+        );
+        if (p === chain.pts.length - 1) continue;
+        const [qx, qz] = chain.pts[p + 1];
+        const sx = qx - px;
+        const sz = qz - pz;
+        const span = Math.hypot(sx, sz);
+        const segs = Math.max(4, Math.round(span / 1.2));
+        const sag = Math.min(0.45, span * 0.05);
+        const yaw = Math.atan2(sx, sz);
+        for (let k = 0; k < segs; k++) {
+          const t = (k + 0.5) / segs;
+          this.addBox(
+            'deco_cable',
+            'polymer',
+            0x17181a,
+            new Vector3(px + sx * t, chain.cy - sag * 4 * t * (1 - t), pz + sz * t),
+            new Vector3(0.05, 0.05, (span / segs) * 1.25),
+            0.4,
+            yaw,
+          );
+        }
+      }
+    }
+
+    /* Wall pipe runs with brackets. Cylinders are open-ended (the ends die
+     * inside walls) and pushed straight into the material bucket — merged with
+     * the rest of the run into one draw call. Rotation happens BEFORE
+     * translation (geometry ops compose in order), so each run is laid onto
+     * its axis first and then moved into place. Straps span both pipes of a
+     * run so one small box per bracket sells the whole assembly. */
+    const pipeOpts = { roughness: 0.85, metalness: 0.6 };
+    // Corridor north wall: a long twin run the player parallels for the whole
+    // map's spine.
+    for (const [r, y] of [[0.075, 2.58] as const, [0.05, 2.3] as const]) {
+      const g = new CylinderGeometry(r, r, 44, 8, 1, true);
+      g.rotateZ(Math.PI / 2); // cylinder's Y axis -> X: the run lies along the corridor
+      g.translate(0.7, y, -21.64);
+      this.bucket('deco_pipe', 'rustedMetal', 0x5a4636, pipeOpts).geos.push(g);
+    }
+    for (const bx of [-18, -12, -6, 0, 6, 12, 18]) {
+      this.addBox(
+        'deco_pipe_bracket',
+        'rustedMetal',
+        0x4c3c2e,
+        new Vector3(bx, 2.44, -21.72),
+        new Vector3(0.05, 0.44, 0.09),
+        0.8,
+        0,
+        pipeOpts,
+      );
+    }
+    // Hall east wall: a shorter riser run beside the warehouse door.
+    for (const [r, y] of [[0.07, 2.75] as const, [0.045, 2.47] as const]) {
+      const g = new CylinderGeometry(r, r, 9.4, 8, 1, true);
+      g.rotateX(Math.PI / 2); // Y axis -> Z: the run climbs the hall's east wall
+      g.translate(7.73, y, -1);
+      this.bucket('deco_pipe', 'rustedMetal', 0x5a4636, pipeOpts).geos.push(g);
+    }
+    for (const bz of [-4, -1, 2]) {
+      this.addBox(
+        'deco_pipe_bracket',
+        'rustedMetal',
+        0x4c3c2e,
+        new Vector3(7.77, 2.61, bz),
+        new Vector3(0.09, 0.42, 0.05),
+        0.8,
+        0,
+        pipeOpts,
+      );
+    }
+
+    /* Puddle patches: near-black low-roughness quads a hair above the floor.
+     * Three overlapping offset lobes per puddle break the perfect-ellipse
+     * outline a single quad would give. Placed just inside three high-traffic
+     * doorways, entirely within carved walkable space. */
+    const puddles: [number, number][] = [
+      [-0.3, 6.2], // lobby, by the hall opening
+      [6.95, -0.9], // hall, by the warehouse door
+      [-13.9, -20.7], // corridor, by the train-shed doorway
+    ];
+    const lobes: [number, number, number, number, number][] = [
+      // [size x, size z, offset x, offset z, extra yaw]
+      [1.7, 1.1, 0, 0, 0],
+      [0.95, 0.75, 0.45, 0.35, 0.55],
+      [0.62, 0.5, -0.4, -0.28, -0.7],
+    ];
+    for (const [uxp, uzp] of puddles) {
+      const baseYaw = rng.range(0, Math.PI);
+      for (const [sw, sd, ox, oz, rot] of lobes) {
+        const yaw = baseYaw + rot;
+        this.addBox(
+          'deco_puddle',
+          'asphalt',
+          0x111315,
+          new Vector3(
+            uxp + ox * Math.cos(yaw) + oz * Math.sin(yaw),
+            0.008,
+            uzp - ox * Math.sin(yaw) + oz * Math.cos(yaw),
+          ),
+          new Vector3(sw, 0.008, sd),
+          0.7,
+          yaw,
+          { roughness: 0.12, metalness: 0.04, normalScale: 0.15 },
+        );
+      }
+    }
+
+    /* Litter, dropped furniture and stored junk — the layer that turns a clean
+     * greybox into a place people left in a hurry. Same rules as everything
+     * above: deco_ buckets (no shadow casting, no colliders), everything lying
+     * flat or leaning flush against a wall inside already-walkable space. */
+    const paperTints = [0xcfcabc, 0xbfb49a, 0xd8d2c2];
+    // [x, z, yaw] clusters sit beside bins and doorways where pockets would be.
+    const papers: [number, number][] = [
+      [-6.55, 14.6], [-6.35, 15.15], [-6.6, 9.3], // lobby, west wall by the bins
+      [-4.05, -21.45], [-3.35, -21.6], [-4.5, -20.95], // train shed, south wall
+      [23.45, 3.25], [23.6, 4.05], // concourse, yard doorway
+      [7.4, -2.6], // hall, warehouse door
+    ];
+    for (const [px, pz] of papers) {
+      this.addBox(
+        `deco_paper${paperTints.indexOf(paperTints[0]) >= 0 ? '' : ''}`,
+        'plaster',
+        paperTints[Math.floor(rng.range(0, paperTints.length))],
+        new Vector3(px, 0.012, pz),
+        new Vector3(0.3, 0.004, 0.42),
+        1.6,
+        rng.range(0, Math.PI),
+        { roughness: 0.9, metalness: 0 },
+      );
+    }
+    // A second sheet per cluster lifted a hair and turned, so pairs read as two
+    // sheets rather than one duplicated quad.
+    for (const [px, pz] of [[-6.5, 14.85], [-3.75, -21.5], [23.52, 3.65]] as [number, number][]) {
+      this.addBox(
+        'deco_paper2',
+        'plaster',
+        0xb9ae92,
+        new Vector3(px, 0.02, pz),
+        new Vector3(0.28, 0.004, 0.4),
+        1.6,
+        rng.range(0, Math.PI),
+        { roughness: 0.92, metalness: 0 },
+      );
+    }
+
+    /* Tipped chair, lobby west wall: seat + back + four legs in one rotated
+     * group pose — lying on its side, backrest toward the wall. Built from
+     * chamfered boxes; total ~120 triangles. */
+    {
+      const chairYaw = 0.62;
+      const chairParts: [number, number, number, number, number, number][] = [
+        // [sx, sy, sz, ox, oy, oz] in chair-local space (origin at seat centre)
+        [0.42, 0.035, 0.42, 0, 0, 0], // seat
+        [0.42, 0.46, 0.035, 0, 0.24, -0.19], // backrest
+        [0.032, 0.44, 0.032, -0.17, -0.235, -0.17], // legs
+        [0.032, 0.44, 0.032, 0.17, -0.235, -0.17],
+        [0.032, 0.44, 0.032, -0.17, -0.235, 0.17],
+        [0.032, 0.44, 0.032, 0.17, -0.235, 0.17],
+      ];
+      const cy = 0.06;
+      const cxw = -6.35;
+      const czw = 11.1;
+      for (const [sx, sy, sz, ox, oy, oz] of chairParts) {
+        const rx = ox * Math.cos(chairYaw) + oz * Math.sin(chairYaw);
+        const rz = -ox * Math.sin(chairYaw) + oz * Math.cos(chairYaw);
+        this.addBox(
+          'deco_chair',
+          'gunWood',
+          0x6b5638,
+          new Vector3(cxw + rx, cy + oy, czw + rz),
+          new Vector3(sx, sy, sz),
+          1.1,
+          chairYaw,
+          { roughness: 0.8, metalness: 0.02 },
+        );
+      }
+    }
+
+    /* Broom leaning against the hall's west wall beside the plant door:
+     * handle tilted into the wall, head block and bristle slab at the foot. */
+    {
+      const hx = -8.72;
+      const hy = 0.72;
+      const hz = -3.1;
+      const lean = 0.3;
+      const handleGeo = new CylinderGeometry(0.013, 0.013, 1.42, 8);
+      handleGeo.rotateZ(lean);
+      handleGeo.translate(hx, hy, hz);
+      this.bucket('deco_broom', 'gunWood', 0x7a6647, { roughness: 0.75, metalness: 0 }).geos.push(handleGeo);
+      this.addBox('deco_broom_head', 'gunWood', 0x5c4c33, new Vector3(hx + 0.22, 0.07, hz), new Vector3(0.34, 0.055, 0.075), 1.2, 0, { roughness: 0.8 });
+      this.addBox('deco_broom_bristle', 'plaster', 0x9a8a5e, new Vector3(hx + 0.22, 0.028, hz), new Vector3(0.32, 0.05, 0.06), 1.2, 0, { roughness: 0.95 });
+    }
+
+    /* Flattened cardboard near the yard door, concourse east wall: two low
+     * slabs slightly askew, plus a third folded upright against the wall. */
+    for (const [bx, bz, bw, bd, byaw, bh] of [
+      [23.5, 5.1, 0.78, 0.55, 0.35, 0.02],
+      [23.55, 5.85, 0.7, 0.5, -0.2, 0.016],
+    ] as [number, number, number, number, number, number][]) {
+      this.addBox(
+        'deco_cardboard',
+        'plaster',
+        0x8a744f,
+        new Vector3(bx, 0.012 + bh, bz),
+        new Vector3(bw, bh, bd),
+        1.3,
+        byaw,
+        { roughness: 0.88, metalness: 0 },
+      );
+    }
+    this.addBox(
+      'deco_cardboard_upright',
+      'plaster',
+      0x7e6a48,
+      new Vector3(23.68, 0.36, 6.6),
+      new Vector3(0.04, 0.72, 0.6),
+      1.3,
+      0.12,
+      { roughness: 0.9 },
+    );
+
+    /* Wall-base grime skirting: a dark band hugging the floor line of the two
+     * walls the camera sees most (hall east, lobby west). Reads as years of
+     * mop-avoidance; breaks the wall/floor hard edge the critic flagged. */
+    for (const [skx, skz, skl, skyaw] of [
+      [6.93, 8, 9, Math.PI / 2],
+      [-6.93, 12, 10, Math.PI / 2],
+      [-0.2, 4.83, 8, 0],
+    ] as [number, number, number, number][]) {
+      this.addBox(
+        'deco_skirting',
+        'paintedMetal',
+        0x26282a,
+        new Vector3(skx, 0.09, skz),
+        new Vector3(skyaw ? 0.035 : skl, 0.18, skyaw ? skl : 0.035),
+        0.8,
+        0,
+        { roughness: 0.85, metalness: 0.1 },
+      );
+    }
   }
 
   private addLighting() {

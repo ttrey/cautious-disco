@@ -33,7 +33,9 @@ const PRESETS: Record<QualityPreset, QualitySettings> = {
     antialias: true,
     bloom: true,
     shadows: true,
-    shadowMapSize: 512,
+    // 1024 keeps practical shadows from visibly stair-stepping at mid tier
+    // without doubling the shadow-fill cost of the skinned horde.
+    shadowMapSize: 1024,
     scopeSize: 480,
     scopeCadence: 2,
     textureScale: 0.75,
@@ -41,11 +43,18 @@ const PRESETS: Record<QualityPreset, QualitySettings> = {
   },
   high: {
     preset: 'high',
+    // Modern GPUs hold a full 2x DPR buffer for the terminal's static
+    // geometry, and the extra pixels are what make tight speculars and thin
+    // sodium fixtures read as premium rather than soft. The adaptive
+    // resolution loop is the safety valve: it steps the render scale down on
+    // sustained sub-50 fps frames, so the ceiling can sit at native DPR.
     maxPixelRatio: 2,
     antialias: true,
     bloom: true,
     shadows: true,
-    shadowMapSize: 1024,
+    // 2048 matches the raised pixel ratio: contact shadows from the practical
+    // lamps stay crisp on the concrete instead of blurring into the haze.
+    shadowMapSize: 2048,
     scopeSize: 640,
     scopeCadence: 1,
     textureScale: 1,
@@ -61,7 +70,10 @@ export function resolveQuality(preference: QualityPreference): QualitySettings {
   const cores = navigator.hardwareConcurrency || 4;
   const coarsePointer = matchMedia('(pointer: coarse)').matches;
 
-  if ((memory !== undefined && memory <= 4) || cores <= 4) return PRESETS.low;
+  // Four-core machines are common with a discrete GPU. Keep them in the
+  // authored medium tier unless memory is genuinely constrained; the low tier
+  // removes both shadows and bloom and makes the shipped baseline look flat.
+  if ((memory !== undefined && memory <= 4) || cores <= 2) return PRESETS.low;
   if ((memory !== undefined && memory <= 8) || cores <= 8 || coarsePointer) return PRESETS.medium;
   return PRESETS.high;
 }

@@ -182,14 +182,41 @@ export class Zombie {
 
   private readonly rng: Rng;
   private readonly baseSkinColor = new Color();
+  private readonly baseClothColor = new Color();
   private readonly skinMaterial: MeshStandardMaterial;
+  private readonly clothMaterial: MeshStandardMaterial;
+  /** Root scale is the visual kind silhouette; hit capsules use the same scale. */
+  private modelBulk = 1;
+  private modelHeight = 1;
+  /**
+   * Visual-only animation scheduler. The mixer is the expensive part of a
+   * zombie update; movement, steering, damage windows and hitboxes never use
+   * this clock. Each pooled body gets a stable phase so nine mixers do not all
+   * wake up on the same render frame and turn a small horde into a CPU spike.
+   */
+  private animationTimer = 0;
+  private animationDeadline = 1 / 60;
+  private animationCadence = 1 / 60;
+  private readonly animationPhase: number;
+
+  /** Last root transform sent to Three; static death poses need no rewrites. */
+  private renderedX = Number.NaN;
+  private renderedY = Number.NaN;
+  private renderedZ = Number.NaN;
+  private renderedYaw = Number.NaN;
 
   constructor(seed: number) {
     this.rng = new Rng(seed * 2654435761);
     this.rig = buildZombieMesh(seed);
     this.animator = new ZombieAnimator(this.rig, this.rng);
+    // Derive a cosmetic phase without consuming the gameplay RNG sequence.
+    // That keeps spawn yaw and attack timing identical before and after this
+    // optimization while distributing mixer work across the frame.
+    this.animationPhase = ((seed * 0.7548776662466927) % 1 + 1) % 1;
     this.skinMaterial = this.rig.skin.material as MeshStandardMaterial;
+    this.clothMaterial = this.rig.clothes.material as MeshStandardMaterial;
     this.baseSkinColor.copy(this.skinMaterial.color);
+    this.baseClothColor.copy(this.clothMaterial.color);
     this.rig.root.visible = false;
   }
 
@@ -206,11 +233,26 @@ export class Zombie {
     this.attackCooldown = this.rng.range(0.2, 0.8);
     this.deathTimer = 0;
     this.flashTimer = 0;
+    this.animationTimer = 0;
+    this.animationCadence = 1 / 60;
+    this.animationDeadline = (0.45 + this.animationPhase * 0.55) * this.animationCadence;
+    this.renderedX = Number.NaN;
+    this.renderedY = Number.NaN;
+    this.renderedZ = Number.NaN;
+    this.renderedYaw = Number.NaN;
+    this.modelBulk = def.bulk;
+    this.modelHeight = def.height;
 
     this.rig.root.visible = true;
-    this.rig.root.position.copy(at);
+    // Kinds must read as different bodies before they move: a sprinter is
+    // narrow and quick, while a brute owns more of the doorway. Scaling the
+    // rig at its feet preserves the nav contract and lets raycast use the
+    // exact same scale for the animated hit capsules below.
+    this.rig.root.scale.set(this.modelBulk, this.modelHeight, this.modelBulk);
+    this.syncVisualTransform(Math.PI);
     // Kind tints multiply the per-instance skin colour chosen at build time.
     this.skinMaterial.color.copy(this.baseSkinColor).multiply(_tint.setHex(def.tint));
+    this.clothMaterial.color.copy(this.baseClothColor).multiplyScalar(def.kind === 'brute' ? 0.88 : 1);
     this.animator.reset();
     this.animator.play('walk', 0);
   }
@@ -221,13 +263,36 @@ export class Zombie {
     this.rig.root.visible = false;
   }
 
+  private syncVisualTransform(yawOffset: number) {
+    if (
+      this.renderedX !== this.position.x ||
+      this.renderedY !== this.position.y ||
+      this.renderedZ !== this.position.z
+    ) {
+      this.rig.root.position.copy(this.position);
+      this.renderedX = this.position.x;
+      this.renderedY = this.position.y;
+      this.renderedZ = this.position.z;
+    }
+
+    const rootYaw = this.yaw + yawOffset;
+    if (this.renderedYaw !== rootYaw) {
+      this.rig.root.rotation.y = rootYaw;
+      this.renderedYaw = rootYaw;
+    }
+  }
+
   get eyeHeight() {
-    return this.rig.height * 0.9;
+    return this.rig.height * this.modelHeight * 0.9;
   }
 
   /** Centre of mass, used for audio and AI targeting. */
   centre(out = new Vector3()): Vector3 {
-    return out.set(this.position.x, this.position.y + this.rig.height * 0.55, this.position.z);
+    return out.set(
+      this.position.x,
+      this.position.y + this.rig.height * this.modelHeight * 0.55,
+      this.position.z,
+    );
   }
 
   /**
@@ -238,7 +303,9 @@ export class Zombie {
     if (!this.active || this.state === 'dead') return null;
 
     // Cheap reject: sphere around the whole body.
-    _tmp.copy(this.position).setY(this.position.y + this.rig.height * 0.5).sub(origin);
+    _tmp.copy(this.position)
+      .setY(this.position.y + this.rig.height * this.modelHeight * 0.5)
+      .sub(origin);
     const along = _tmp.dot(dir);
     if (along < -1.2 || along > maxDist + 1.2) return null;
     if (_tmp.lengthSq() - along * along > 1.6) return null;
@@ -257,9 +324,12 @@ export class Zombie {
       } else {
         // Head: extend upward in the bone's own frame.
         boneA.getWorldQuaternion(_quat);
-        _b.copy(box.extend!).applyQuaternion(_quat).add(_a);
+        _b.copy(box.extend!).multiplyScalar(this.modelHeight).applyQuaternion(_quat).add(_a);
       }
-      const t = rayCapsule(origin, dir, _a, _b, box.radius * this.def.bulk, maxDist);
+      // Bone endpoints already include root scale. Scaling the radius by the
+      // same horizontal factor keeps the capsule tight to the visible limb
+      // instead of making the brute's hitbox twice as wide as its mesh.
+      const t = rayCapsule(origin, dir, _a, _b, box.radius * this.modelBulk, maxDist);
       if (t >= 0 && (!best || t < best.distance)) {
         best = {
           distance: t,
@@ -276,7 +346,7 @@ export class Zombie {
   takeDamage(amount: number, hit: HitResult): boolean {
     if (this.state === 'dying' || this.state === 'dead') return false;
     this.health -= amount;
-    this.flashTimer = 0.11;
+    this.flashTimer = Math.max(this.flashTimer, 0.13);
     // Bigger hits stagger harder; a headshot always flinches.
     this.animator.flinch(clamp(amount / this.maxHealth, 0.25, 1) + (hit.label === 'head' ? 0.4 : 0));
 
@@ -301,8 +371,32 @@ export class Zombie {
    */
   reactToHit(hit: HitResult) {
     if (this.state === 'dying' || this.state === 'dead') return;
-    this.flashTimer = 0.11;
+    this.flashTimer = Math.max(this.flashTimer, 0.13);
     this.animator.flinch(0.35 + (hit.label === 'head' ? 0.4 : 0));
+  }
+
+  /** 0..1 progress through the current melee swing, for authored lunges. */
+  get attackProgress() {
+    return this.state === 'attacking' ? clamp(this.attackTimer / 0.95, 0, 1) : 0;
+  }
+
+  private shouldRun(speed: number) {
+    // Sprinters are intentionally locomotion-authored runners. The old
+    // speed-only test compared against 1.35x their target speed, so they
+    // visually shambled while moving at their fastest gameplay pace.
+    return this.def.kind === 'sprinter' || speed > this.baseSpeed * 1.16;
+  }
+
+  private updateImpactFlash(dt: number) {
+    if (this.flashTimer <= 0) return;
+    this.flashTimer -= dt;
+    const k = clamp(this.flashTimer / 0.13, 0, 1);
+    const skin = this.skinMaterial.color
+      .copy(this.baseSkinColor)
+      .multiply(_tint.setHex(this.def.tint));
+    skin.lerp(_white, k * 0.78);
+    this.clothMaterial.color.copy(this.baseClothColor).multiplyScalar(this.def.kind === 'brute' ? 0.88 : 1);
+    this.clothMaterial.color.lerp(_white, k * 0.34);
   }
 
   /**
@@ -325,16 +419,9 @@ export class Zombie {
     onAttack: (damage: number) => void,
   ) {
     if (!this.active) return;
-    this.animator.update(dt);
+    this.updateAnimation(dt, distanceToLocalPlayer);
 
-    if (this.flashTimer > 0) {
-      this.flashTimer -= dt;
-      const k = clamp(this.flashTimer / 0.11, 0, 1);
-      this.skinMaterial.color
-        .copy(this.baseSkinColor)
-        .multiply(_tint.setHex(this.def.tint))
-        .lerp(_white, k * 0.75);
-    }
+    this.updateImpactFlash(dt);
 
     const previous = this.state;
     this.state = state;
@@ -345,8 +432,7 @@ export class Zombie {
         this.animator.playOneShot('death');
       }
       this.deathTimer += dt;
-      this.rig.root.position.copy(this.position);
-      this.rig.root.rotation.y = this.yaw + Math.PI;
+      this.syncVisualTransform(Math.PI);
       return;
     }
 
@@ -366,41 +452,36 @@ export class Zombie {
       }
     } else {
       const speed = this.velocity.length();
-      this.animator.play(speed > this.baseSpeed * 1.35 ? 'run' : 'walk', 0.3);
+      this.animator.play(this.shouldRun(speed) ? 'run' : 'walk', 0.22);
     }
 
-    this.rig.root.position.copy(this.position);
-    this.rig.root.rotation.y = this.yaw + Math.PI;
+    this.syncVisualTransform(Math.PI);
   }
 
   /** Advances state that does not depend on the world (called by the manager). */
   update(dt: number, playerPos: Vector3, playerRadius: number, onAttack: (damage: number) => void) {
     if (!this.active) return;
 
-    this.animator.update(dt);
-
-    if (this.flashTimer > 0) {
-      this.flashTimer -= dt;
-      // Brief white flash on the skin so hits register even in a dark corner.
-      const k = clamp(this.flashTimer / 0.11, 0, 1);
-      this.skinMaterial.color
-        .copy(this.baseSkinColor)
-        .multiply(_tint.setHex(this.def.tint))
-        .lerp(_white, k * 0.75);
-    }
+    // Brief flash on flesh and cloth so a hit reads in a dark corner without
+    // touching the shared gear material used by every pooled zombie.
+    this.updateImpactFlash(dt);
 
     if (this.state === 'dying') {
+      // Death is gameplay-terminal, so distant corpses can use the same visual
+      // cadence as the rest of the horde without changing the damage window or
+      // the brief, close-up collapse beside the player.
+      this.updateAnimation(dt, this.position.distanceTo(playerPos));
       this.deathTimer += dt;
       // Bodies linger briefly, then despawn to keep the draw count in check.
-      if (this.deathTimer > 4.5) this.despawn();
-      this.rig.root.position.copy(this.position);
-      this.rig.root.rotation.y = this.yaw;
+      if (this.deathTimer > 2.7) this.despawn();
+      this.syncVisualTransform(0);
       return;
     }
 
     _tmp.subVectors(playerPos, this.position);
     _tmp.y = 0;
     const distance = _tmp.length();
+    this.updateAnimation(dt, distance);
     const reach = this.radius * this.def.bulk + playerRadius + 0.55;
 
     if (this.state === 'attacking') {
@@ -439,12 +520,43 @@ export class Zombie {
 
     const speed = this.velocity.length();
     if (this.state !== 'attacking') {
-      this.animator.play(speed > this.baseSpeed * 1.35 ? 'run' : 'walk', 0.3);
+      this.animator.play(this.shouldRun(speed) ? 'run' : 'walk', 0.22);
     }
 
-    this.rig.root.position.copy(this.position);
     // Model faces -Z, so add PI to point it down +yaw.
-    this.rig.root.rotation.y = this.yaw + Math.PI;
+    this.syncVisualTransform(Math.PI);
+  }
+
+  /**
+   * Keeps nearby silhouettes fluid while amortising expensive skinned-mesh
+   * mixer work for the back of a wave. AI and collision still run every frame;
+   * only visual pose sampling is decimated.
+   */
+  private updateAnimation(dt: number, distance: number) {
+    // Keep the silhouette nearest the operator at the original 60 Hz. At the
+    // size a body occupies on screen beyond 12 m, 30 Hz is visually stable;
+    // beyond 24 m the horde reads as a moving mass and 15 Hz avoids paying for
+    // nineteen-bone mixer work that cannot be perceived. This is deliberately
+    // independent of AI and hit testing, which remain full-rate below.
+    const cadence = distance > 24 ? 1 / 15 : distance > 12 ? 1 / 30 : 1 / 60;
+
+    if (cadence !== this.animationCadence) {
+      const phase = clamp(this.animationDeadline / this.animationCadence, 0, 1);
+      this.animationCadence = cadence;
+      this.animationDeadline = Math.max(0.001, cadence * phase);
+    }
+
+    this.animationTimer += dt;
+    if (this.animationTimer < this.animationDeadline) return;
+
+    const step = this.animationTimer;
+    const overrun = this.animationTimer - this.animationDeadline;
+    this.animationTimer = 0;
+    // Carry the overrun into the next deadline so each body keeps its phase
+    // instead of synchronising all mixers after the first update. `step` still
+    // contains the complete elapsed time, so animation speed remains correct.
+    this.animationDeadline = Math.max(0.001, cadence - Math.min(overrun, cadence * 0.9));
+    this.animator.update(step);
   }
 
   /** Smoothly settles the body onto the floor height under it. */

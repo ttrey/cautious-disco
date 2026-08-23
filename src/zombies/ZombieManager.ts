@@ -136,10 +136,16 @@ export class ZombieManager {
   private readonly rng = new Rng(0xa11e5);
   private roundHealth = 100;
   private roundSpeed = 1.4;
+  private roundNumber = 0;
+  private releasedThisRound = 0;
+  private lastSpawn: SpawnPoint | null = null;
   private sprinterChance = 0;
   private bruteChance = 0;
   private readonly spatialBins = new Map<number, Zombie[]>();
   private readonly spatialKeys: number[] = [];
+
+  /** Reused active count for the spawn gate; avoids a second pool reduction. */
+  private activeForSpawn = 0;
 
   onPlayerHit?: (damage: number) => void;
   onKill?: (zombie: Zombie) => void;
@@ -203,6 +209,9 @@ export class ZombieManager {
   /** Configures the wave. Difficulty scaling lives entirely here. */
   beginRound(round: number, count: number) {
     this.pendingSpawns = count;
+    this.roundNumber = round;
+    this.releasedThisRound = 0;
+    this.lastSpawn = null;
     // Health ramps gently to round 10 then compounds, mirroring the classic
     // curve: early rounds are a warm-up, the twenties are a wall.
     this.roundHealth = round <= 9 ? 100 + (round - 1) * 32 : 388 * Math.pow(1.09, round - 9);
@@ -210,7 +219,10 @@ export class ZombieManager {
     this.sprinterChance = round < 4 ? 0 : clamp((round - 3) * 0.06, 0, 0.45);
     this.bruteChance = round < 7 ? 0 : clamp((round - 6) * 0.035, 0, 0.22);
     this.spawnInterval = clamp(2.6 - round * 0.11, 0.55, 2.6);
-    this.spawnTimer = 1.2;
+    // The first three arrivals have a deliberate beat: one readable threat,
+    // then a pair that establishes the horde rhythm. Later rounds use the
+    // normal pressure curve immediately.
+    this.spawnTimer = round === 1 ? 1.45 : 1.2;
   }
 
   /** Immediately clears the field — used on game over and restart. */
@@ -240,13 +252,31 @@ export class ZombieManager {
     );
     if (usable.length === 0) return open.length ? this.rng.pick(open) : null;
 
+    const withoutLast = usable.filter((s) => s !== this.lastSpawn);
+    const candidates = withoutLast.length ? withoutLast : usable;
+
+    // The opening wave is staged from the far side of the currently open area.
+    // That buys the player a clean read of the first body and makes the first
+    // contact feel like an authored entrance instead of a random teleport.
+    if (this.roundNumber === 1 && this.releasedThisRound < 3) {
+      const intro = candidates.find(
+        (s) => s.zone === 'start' && s.position.z > -4 && s.position.z < 3,
+      );
+      if (this.releasedThisRound === 0 && intro) return intro;
+      candidates.sort(
+        (a, b) => b.position.distanceToSquared(anchor) - a.position.distanceToSquared(anchor),
+      );
+      const window = Math.max(1, Math.ceil(candidates.length * 0.45));
+      return candidates[this.rng.int(0, window - 1)];
+    }
+
     // Weight toward spawns that are close (but not too close) so pressure comes
     // from the area the anchor player is actually in.
-    usable.sort(
+    candidates.sort(
       (a, b) => a.position.distanceToSquared(anchor) - b.position.distanceToSquared(anchor),
     );
-    const window = Math.max(1, Math.ceil(usable.length * 0.6));
-    return usable[this.rng.int(0, window - 1)];
+    const window = Math.max(1, Math.ceil(candidates.length * 0.6));
+    return candidates[this.rng.int(0, window - 1)];
   }
 
   private release(players: readonly Vector3[]) {
@@ -287,6 +317,8 @@ export class ZombieManager {
       this.roundHealth * def.healthMultiplier,
       this.roundSpeed * def.speedMultiplier,
     );
+    this.lastSpawn = spawn;
+    this.releasedThisRound++;
     this.pendingSpawns--;
   }
 
@@ -318,9 +350,12 @@ export class ZombieManager {
     if (this.pendingSpawns > 0) {
       this.spawnTimer -= dt;
       const liveCap = 28;
-      if (this.spawnTimer <= 0 && this.aliveCount < liveCap) {
+      if (this.spawnTimer <= 0 && this.activeForSpawn < liveCap) {
         this.release(players);
-        this.spawnTimer = this.spawnInterval * this.rng.range(0.65, 1.35);
+        const openingBeat = this.roundNumber === 1 && this.releasedThisRound < 3
+        ? [1.8, 1.35][this.releasedThisRound - 1] ?? 1.05
+          : this.spawnInterval * this.rng.range(0.65, 1.35);
+        this.spawnTimer = openingBeat;
       }
     }
 
@@ -341,8 +376,10 @@ export class ZombieManager {
     }
 
     this.rebuildSpatialBins();
+    this.activeForSpawn = 0;
     for (const z of this.pool) {
       if (!z.active) continue;
+      if (z.state !== 'dying') this.activeForSpawn++;
       // Each body chases whoever is nearest to it, which is also what the
       // multi-source flow field routes it toward.
       const targetIndex = this.nearestPlayerIndex(z.position, players);
@@ -590,7 +627,8 @@ export class ZombieManager {
           _tmp.subVectors(z.position, other.position);
           _tmp.y = 0;
           const distSq = _tmp.lengthSq();
-          const minDist = (z.radius + other.radius) * 1.25;
+          const contact = z.state === 'attacking' || other.state === 'attacking';
+          const minDist = (z.radius + other.radius) * (contact ? 1.08 : 1.24);
           if (distSq > 1e-6 && distSq < minDist * minDist) {
             const dist = Math.sqrt(distSq);
             _sep.addScaledVector(_tmp.divideScalar(dist), (minDist - dist) / minDist);
@@ -630,8 +668,21 @@ export class ZombieManager {
     }
     _desired.addScaledVector(_avoid, speed * 1.1);
 
-    // Attacking zombies plant their feet.
-    if (z.state === 'attacking') _desired.multiplyScalar(0.12);
+    // Attacks have a short authored lunge on the strike beat, then settle into
+    // planted contact. Keeping it in steering (with the nav constraint below)
+    // preserves collision and prevents visual root-motion drift.
+    if (z.state === 'attacking') {
+      const progress = z.attackProgress;
+      const lunge = progress < 0.34 ? 0.08 : progress < 0.6 ? 0.44 : 0.12;
+      _desired.multiplyScalar(lunge);
+    }
+
+    // Separation is allowed to ask for a little extra urgency, never an
+    // unbounded speed spike. This keeps the front rank readable and prevents
+    // a crowded doorway from slingshotting bodies through a corner.
+    const maxDesired = speed * (z.state === 'attacking' ? 1.05 : 1.22);
+    const desiredLength = Math.hypot(_desired.x, _desired.z);
+    if (desiredLength > maxDesired) _desired.multiplyScalar(maxDesired / desiredLength);
 
     // Accelerate toward the desired velocity rather than snapping to it.
     z.velocity.x += (_desired.x - z.velocity.x) * (1 - Math.exp(-7 * dt));

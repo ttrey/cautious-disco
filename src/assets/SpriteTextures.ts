@@ -262,6 +262,36 @@ export function glowTexture(): Texture {
   });
 }
 
+/**
+ * Soft elliptical contact shadow — black core, feathered edge, alpha falloff.
+ *
+ * Used as a normal-blended darkening card: the RGB stays black everywhere and
+ * the alpha gradient does all the work, so whatever is behind it loses a
+ * fraction of its brightness in the centre and none at the rim. Drawn wider
+ * than tall because the shadow it stands in for (a weapon held against the
+ * body) spreads horizontally across the torso.
+ */
+export function contactShadowTexture(): Texture {
+  return memo('contactShadow', () => {
+    const S = 128;
+    const [c, ctx] = canvas(S);
+    const g = ctx.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+    g.addColorStop(0, 'rgba(0,0,0,0.9)');
+    g.addColorStop(0.45, 'rgba(0,0,0,0.45)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    // Stretch the falloff horizontally for the wide, low shape of a shouldered
+    // weapon's occlusion zone.
+    ctx.save();
+    ctx.translate(S / 2, S / 2);
+    ctx.scale(1.35, 1);
+    ctx.translate(-S / 2, -S / 2);
+    ctx.fillRect(0, 0, S, S);
+    ctx.restore();
+    return finish(c);
+  });
+}
+
 /** Simple text label baked to a texture — perk machine and wall-buy signage. */
 export function labelTexture(
   lines: string[],

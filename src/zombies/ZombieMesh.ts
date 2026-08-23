@@ -2,7 +2,6 @@ import {
   Bone,
   BufferAttribute,
   BufferGeometry,
-  CylinderGeometry,
   DoubleSide,
   Float32BufferAttribute,
   Group,
@@ -114,7 +113,6 @@ export interface ZombieRig {
  * around it. Anything approaching white turns the eye into a golf ball.
  */
 const SCLERA: Tint = [0.98, 0.9, 0.66];
-const IRIS: Tint = [0.3, 0.34, 0.32];
 const PUPIL: Tint = [0.05, 0.05, 0.055];
 const TOOTH: Tint = [1.34, 1.2, 0.86];
 const GUM: Tint = [0.62, 0.26, 0.24];
@@ -151,6 +149,95 @@ interface HeadSpec {
   gaze: [number, number];
   eyeMilky: number;
   seed: number;
+}
+
+/**
+ * A shallow, layered wound cup. The torso is intentionally kept as one closed
+ * skinned surface for deformation and hit testing, so a literal boolean hole
+ * would be the wrong trade: it would split the body into extra render meshes
+ * and make the tear fragile under animation. This patch gives the eye the cues
+ * that matter at play distance — a raised frayed rim, a wet inner wall and a
+ * dark floor — while staying inside the existing single skin draw call.
+ *
+ * `centre` is the host surface point and `normal` points out of the body. The
+ * floor remains a hair above the closed torso rather than z-fighting with it;
+ * the apparent depth comes from the concentric normals and colour falloff.
+ */
+function buildWoundCavity(
+  centre: Vector3,
+  normal: Vector3,
+  radiusX: number,
+  radiusY: number,
+  depth: number,
+  seed: number,
+): BufferGeometry {
+  // Twenty sides keep the opening organic at the torso inspection distance.
+  // Four rings give the wound an actual wall and recessed floor instead of a
+  // single faceted red plate.
+  const segments = 20;
+  const up = new Vector3(0, 1, 0);
+  const tangent = new Vector3().crossVectors(normal, up).normalize();
+  const rng = new Rng(seed ^ 0x71c4);
+  const positions: number[] = [];
+  const colors: number[] = [];
+  const indices: number[] = [];
+  const rings = [
+    { scale: 1, offset: 0.008, tint: [0.7, 0.28, 0.2] as Tint },
+    { scale: 0.84, offset: 0.0035, tint: [0.52, 0.12, 0.09] as Tint },
+    { scale: 0.62, offset: -Math.min(depth * 0.28, 0.003), tint: [0.31, 0.045, 0.032] as Tint },
+    { scale: 0.38, offset: -Math.min(depth * 0.52, 0.0038), tint: [0.12, 0.012, 0.01] as Tint },
+  ];
+
+  for (const ring of rings) {
+    for (let i = 0; i < segments; i++) {
+      const a = (i / segments) * TAU;
+      const wobble = 1 + rng.range(-0.13, 0.13) + Math.sin(a * 3 + seed * 0.11) * 0.035;
+      const at = centre.clone()
+        .addScaledVector(tangent, Math.cos(a) * radiusX * ring.scale * wobble)
+        .addScaledVector(up, Math.sin(a) * radiusY * ring.scale * wobble)
+        .addScaledVector(normal, ring.offset);
+      positions.push(at.x, at.y, at.z);
+      colors.push(ring.tint[0], ring.tint[1], ring.tint[2]);
+    }
+  }
+
+  // `centre` is already six millimetres in front of the closed torso. Pull the
+  // floor back relative to that raised centre so it remains just above the
+  // gameplay surface while sitting visibly behind the inner wall. The previous
+  // floor used `centre + 1.5 mm`, which put it ahead of the wall and made the
+  // whole injury read as a flat polygon.
+  const floor = centre.clone().addScaledVector(normal, -0.0045);
+  positions.push(floor.x, floor.y, floor.z);
+  colors.push(CAVITY[0] * 1.25, CAVITY[1] * 0.62, CAVITY[2] * 0.52);
+  const floorIndex = positions.length / 3 - 1;
+
+  // `tangent = normal x up`; this winding faces the outward normal for the
+  // front-facing (-Z) torso and remains coherent as the wound rotates around
+  // the ribcage.
+  for (let ring = 0; ring < rings.length - 1; ring++) {
+    const a0 = ring * segments;
+    const b0 = (ring + 1) * segments;
+    for (let i = 0; i < segments; i++) {
+      const next = (i + 1) % segments;
+      const a = a0 + i;
+      const an = a0 + next;
+      const b = b0 + i;
+      const bn = b0 + next;
+      indices.push(a, bn, an, a, b, bn);
+    }
+  }
+  const innerStart = (rings.length - 1) * segments;
+  for (let i = 0; i < segments; i++) {
+    const next = (i + 1) % segments;
+    indices.push(innerStart + i, floorIndex, innerStart + next);
+  }
+
+  const geo = new BufferGeometry();
+  geo.setAttribute('position', new Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new Float32BufferAttribute(colors, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
 }
 
 /**
@@ -252,7 +339,7 @@ function buildSkullShell(spec: HeadSpec): BufferGeometry {
       // jaw part, which is what keeps it attached when the head deforms.
       const jawLine =
         gaussian(Math.abs(p.x) - 0.046, 0.019) * gaussian(p.y + 0.08, 0.015) * clamp(face + 0.3, 0, 1);
-      dx += 0.004 * jawLine;
+      dx += 0.0055 * jawLine;
       // Submandibular hollow: the shadow under the jaw is what separates a head
       // from the neck it sits on, and it has to be cut, not shaded.
       //
@@ -267,7 +354,10 @@ function buildSkullShell(spec: HeadSpec): BufferGeometry {
       dx -= 0.008 * underJaw * side;
       dz += 0.006 * underJaw * clamp(-face, 0, 1);
       const chin = gaussian(p.x, 0.016) * gaussian(p.y + 0.1, 0.015) * front;
-      dz -= 0.011 * chin;
+      // Pull the chin far enough forward to survive the first-person silhouette
+      // test. The old 11 mm relief was anatomically plausible in a close-up but
+      // disappeared into the throat at gameplay distance.
+      dz -= 0.015 * chin;
       dy -= 0.004 * chin;
       // Mentolabial sulcus — the crease between the lower lip and the chin.
       // Without it the whole lower face is one blank expanse and reads long.
@@ -386,7 +476,10 @@ function eyelid(
 
 /** Eyeball, iris, pupil and both lids for one side. */
 function buildEye(parts: BufferGeometry[], spec: HeadSpec, sx: number, side: number) {
-  const centre = new Vector3(sx * EYE_X, EYE_Y, EYE_Z);
+  // Set the globe slightly proud of the carved orbit. The old landmark was
+  // anatomically plausible in isolation, but the shell's brow relief won the
+  // depth test under dark light and left the eyes reading as black sockets.
+  const centre = new Vector3(sx * EYE_X, EYE_Y, EYE_Z - 0.004);
   const droop = spec.lidDroop[side];
 
   // The globe. Yellowed sclera with blood tracking through it — the veining is
@@ -405,22 +498,57 @@ function buildEye(parts: BufferGeometry[], spec: HeadSpec, sx: number, side: num
   // than as a stain under the surface. A dead eye's iris is clouded, not blue.
   const gazeX = spec.gaze[0];
   const gazeY = spec.gaze[1];
-  const front = new Vector3(centre.x + gazeX, centre.y + gazeY, centre.z - EYE_R * 0.86);
+  const front = new Vector3(centre.x + gazeX, centre.y + gazeY, centre.z - EYE_R * 1.02);
+  const irisOptions: Tint[] = [
+    [0.34, 0.22, 0.09],
+    [0.18, 0.34, 0.21],
+    [0.42, 0.29, 0.1],
+  ];
+  const irisIndex = Math.abs(Math.imul(spec.seed | 0, 31) + side * 17) % irisOptions.length;
+  const irisBase = mixTint(irisOptions[irisIndex], [0.08, 0.07, 0.055], spec.eyeMilky * 0.58);
+
+  // A dark limbal ring keeps the iris from dissolving into the yellowed sclera;
+  // the brighter iris and pinpoint catchlight then survive a few metres away.
   parts.push(
     tint(
-      ellipsoid(front, new Vector3(0.0058, 0.0058, 0.0026), 14, 8),
-      mixTint(IRIS, [0.82, 0.84, 0.8], spec.eyeMilky),
+      ellipsoid(
+        new Vector3(front.x, front.y, front.z + 0.00035),
+        new Vector3(0.0078, 0.0078, 0.0017),
+        16,
+        8,
+      ),
+      mixTint([0.08, 0.055, 0.04], [0.2, 0.24, 0.18], 1 - spec.eyeMilky * 0.65),
+    ),
+  );
+  parts.push((() => {
+    const iris = ellipsoid(front, new Vector3(0.007, 0.007, 0.0029), 16, 8);
+    const grain = makeFbm(spec.seed ^ (0x44d + side), { octaves: 2, frequency: 18 });
+    return tint(iris, (x, y) => {
+      const radial = clamp(Math.hypot(x - front.x, y - front.y) / 0.007, 0, 1);
+      const spokes = 0.5 + 0.5 * Math.sin(Math.atan2(y - front.y, x - front.x) * 9 + spec.seed * 0.17);
+      return mixTint(irisBase, [0.78, 0.57, 0.18], clamp((1 - radial) * 0.28 + spokes * 0.16 + (grain(x * 60, y * 60) - 0.5) * 0.18, 0, 0.52));
+    });
+  })());
+  parts.push(
+    tint(
+      ellipsoid(
+        new Vector3(front.x, front.y, front.z - 0.002),
+        new Vector3(0.00215, 0.00215, 0.0017),
+        12,
+        8,
+      ),
+      mixTint(PUPIL, [0.36, 0.4, 0.34], spec.eyeMilky * 0.7),
     ),
   );
   parts.push(
     tint(
       ellipsoid(
-        new Vector3(front.x, front.y, front.z - 0.0018),
-        new Vector3(0.0027, 0.0027, 0.0016),
-        12,
+        new Vector3(front.x + sx * 0.0016, front.y + 0.0031, front.z - 0.0032),
+        new Vector3(0.00115, 0.00115, 0.00075),
         8,
+        5,
       ),
-      mixTint(PUPIL, [0.5, 0.5, 0.47], spec.eyeMilky * 0.7),
+      [1.55, 1.38, 1.08],
     ),
   );
 
@@ -433,7 +561,10 @@ function buildEye(parts: BufferGeometry[], spec: HeadSpec, sx: number, side: num
     // Lid skin is face-coloured; only the lid margin itself is dark.
     tint(upper, (_x, y) => {
       const margin = clamp((y - (centre.y + Math.sin(0.26 - droop) * lidR)) / 0.004, 0, 1);
-      return mixTint([0.42, 0.34, 0.32], [0.97, 0.95, 0.92], margin);
+      // The previous lid ramp went to near-white over most of the band, which
+      // made one eye read as a pale marble under a helmet. Keep the lid flesh
+      // coloured and reserve the dark end for the wet margin.
+      return mixTint([0.46, 0.3, 0.27], [0.72, 0.54, 0.45], margin * 0.9);
     });
     parts.push(upper);
   }
@@ -441,10 +572,56 @@ function buildEye(parts: BufferGeometry[], spec: HeadSpec, sx: number, side: num
   if (lower) {
     tint(lower, (_x, y) => {
       const margin = clamp(((centre.y + Math.sin(-0.42) * lidR) - y) / 0.004, 0, 1);
-      return mixTint([0.48, 0.38, 0.36], [1.0, 0.97, 0.93], margin);
+      return mixTint([0.48, 0.31, 0.28], [0.68, 0.5, 0.43], margin * 0.85);
     });
     parts.push(lower);
   }
+
+  // A wet lower lid and a small inner-canthus fold separate the globe from the
+  // socket. They are deliberately tiny in geometry but high contrast in tint,
+  // which is the useful scale for a horde viewed at four to eight metres.
+  const wetLid = sweep(
+    [
+      new Vector3(sx * 0.021, centre.y - 0.004, centre.z - 0.013),
+      new Vector3(sx * 0.011, centre.y - 0.012, centre.z - 0.014),
+      new Vector3(0, centre.y - 0.013, centre.z - 0.014),
+    ],
+    () => [0.00145, 0.00105],
+    10,
+    5,
+  );
+  parts.push(tint(wetLid, [0.74, 0.3, 0.25]));
+  parts.push(
+    tint(
+      ellipsoid(new Vector3(sx * 0.019, centre.y - 0.004, centre.z - 0.013), new Vector3(0.003, 0.004, 0.0022), 8, 5),
+      [0.6, 0.18, 0.16],
+    ),
+  );
+
+  // Raised orbital planes: a compact brow and a thin infraorbital shelf break
+  // up the smooth egg silhouette and keep the eye legible when the light is
+  // coming from above. They are merged into the skin mesh, so the three-mesh
+  // draw-call budget and the existing skeleton contract stay unchanged.
+  parts.push(
+    tint(
+      ellipsoid(
+        new Vector3(sx * 0.032, centre.y + 0.013, centre.z - 0.012),
+        new Vector3(0.022, 0.0038, 0.0028),
+        12,
+        6,
+      ),
+      [0.68, 0.54, 0.46],
+    ),
+    tint(
+      ellipsoid(
+        new Vector3(sx * 0.034, centre.y - 0.016, centre.z - 0.006),
+        new Vector3(0.017, 0.0024, 0.0019),
+        10,
+        5,
+      ),
+      [0.54, 0.4, 0.35],
+    ),
+  );
 }
 
 /** Nose: bridge, tip, wings and nostrils — or the bare aperture if rotted. */
@@ -529,20 +706,26 @@ function buildMouth(parts: BufferGeometry[], spec: HeadSpec, rng: Rng) {
     for (let k = -3; k <= 3; k++) gumPts.push(arcPoint(gumY, (k / 3) * 1.05));
     parts.push(tint(sweep(gumPts, () => [0.0042, 0.0038], 14, 6), GUM));
 
-    // Ten front teeth per arcade. Incisors are 8-9 mm tall and 5.5 mm wide;
-    // anything smaller vanishes at gameplay distance, which is why the old
-    // 2 mm pips read as a zip fastener rather than as a mouth.
+    // Nine front teeth per arcade. Rounded enamel bodies avoid the old uniform
+    // cylinder/peg silhouette; missing teeth leave a real gap, canines carry a
+    // little extra mass, and surviving teeth lean independently in their sockets.
     for (let k = -4; k <= 4; k++) {
       const a = (k / 4.6) * 1.15;
-      const missing = rng.chance(0.1 + spec.decay * 0.16);
+      const missing = rng.chance(0.14 + spec.decay * 0.2);
+      if (missing) continue;
       const broken = !missing && rng.chance(0.22);
-      const height = missing ? 0.0022 : broken ? rng.range(0.004, 0.006) : (upper ? 0.0092 : 0.0078);
-      const width = lerp(0.0029, 0.0022, Math.abs(k) / 4.6);
+      const canine = Math.abs(k) === 3;
+      const height = broken
+        ? rng.range(0.0035, 0.0058)
+        : upper
+          ? rng.range(canine ? 0.0078 : 0.0062, canine ? 0.0094 : 0.0082)
+          : rng.range(canine ? 0.0064 : 0.0052, canine ? 0.008 : 0.0072);
+      const width = lerp(canine ? 0.0038 : 0.0032, canine ? 0.0027 : 0.00225, Math.abs(k) / 4.6);
       const at = arcPoint(gumY + sign * height * 0.42, a);
-      const t = new CylinderGeometry(width * 0.86, width, height, 5, 1, false);
-      t.scale(1, 1, 0.62);
+      const t = ellipsoid(new Vector3(), new Vector3(width * 0.94, height * 0.5, width * 0.78), 8, 5);
       t.rotateX(sign * 0.12);
       t.rotateY(-a);
+      t.rotateZ(rng.range(-0.15, 0.15) + a * 0.035);
       t.translate(at.x, at.y, at.z);
       boxProjectUV(t, UV_SCALE);
       const stain = rng.range(0, 1) * spec.decay;
@@ -851,12 +1034,15 @@ function gearMaterial(): MeshStandardMaterial {
   if (!gearBase) {
     gearBase = makeSurface('zombieCloth', {
       repeat: 1,
-      tint: 0x6c7159,
-      roughness: 0.86,
+      // Lift the kit a notch above the black level. The model already carries
+      // baked occlusion and vertex grime; a darker base collapses boots, belt
+      // and helmet into one silhouette under the game's cool fill light.
+      tint: 0x77806a,
+      roughness: 0.9,
       metalness: 0,
       normalScale: 0.7,
     });
-    gearBase.envMapIntensity = 0.5;
+    gearBase.envMapIntensity = 0.62;
     gearBase.vertexColors = true;
   }
   return gearBase;
@@ -870,6 +1056,8 @@ function skinMaterial(rng: Rng): MeshStandardMaterial {
       metalness: 0,
       normalScale: 1.1,
       aoIntensity: 0.85,
+      emissive: 0x17130f,
+      emissiveIntensity: 0.07,
     });
   }
   const m = skinBase.clone();
@@ -888,6 +1076,8 @@ function clothMaterial(rng: Rng): MeshStandardMaterial {
       roughness: 1,
       metalness: 0,
       normalScale: 1.0,
+      emissive: 0x11150f,
+      emissiveIntensity: 0.04,
     });
   }
   const m = clothBase.clone();
@@ -1417,27 +1607,44 @@ function assemble(rng: Rng, seed: number, opts: { bulk?: number; height?: number
         4,
       ),
     );
-    // Digits are two segments each, sharing one open joint: a domed cap costs
-    // three extra rings, and ten fingers' worth of caps is more geometry than
-    // the whole ribcage. The last segment tapers to a claw instead of carrying a
-    // separate nail box, and the fingertips are darkened by the flesh pass.
+    // Digits are two segments each, sharing one open joint. Their curl and spread
+    // vary per hand, while small dirty nails and knuckle pads give the silhouette
+    // a human landmark instead of a mitten edge.
     const knuckle = tip.clone().add(new Vector3(0, 0.006, 0));
     const digit = (base: Vector3, mid: Vector3, end: Vector3, r0: number, r1: number, r2: number) => {
       skinParts.push(tube(base, mid, (t) => [lerp(r0, r1, t), lerp(r0, r1, t)], 6, 1, true, false));
       skinParts.push(tube(mid, end, (t) => [lerp(r1, r2, t), lerp(r1, r2, t)], 6, 1, false, true));
     };
+    const fingerCurl = rng.range(0.86, 1.16);
+    const fingerSpread = rng.range(0.94, 1.08);
     for (let f = 0; f < 4; f++) {
-      const off = (f - 1.5) * 0.0165;
-      const spread = 1 + Math.abs(f - 1.5) * 0.08;
+      const off = (f - 1.5) * 0.0165 * fingerSpread;
+      const spread = (1 + Math.abs(f - 1.5) * 0.08) * fingerCurl;
       const base = knuckle.clone().add(new Vector3(off, 0, -0.004));
-      const mid = base.clone().add(new Vector3(off * 0.12, -0.031 * spread, -0.014));
-      const end = mid.clone().add(new Vector3(off * 0.1, -0.021, -0.023));
+      const mid = base.clone().add(new Vector3(off * 0.12, -0.031 * spread, -0.014 * fingerCurl));
+      const end = mid.clone().add(new Vector3(off * 0.1, -0.021 * fingerCurl, -0.023 * fingerCurl));
       digit(base, mid, end, 0.0092, 0.0078, 0.0042);
+      skinParts.push(
+        tint(
+          ellipsoid(base.clone().add(new Vector3(0, 0.003, -0.002)), new Vector3(0.008, 0.0058, 0.0042), 7, 5),
+          [0.72, 0.57, 0.47],
+        ),
+        tint(
+          ellipsoid(end.clone().add(new Vector3(0, -0.0012, -0.0022)), new Vector3(0.0046, 0.0026, 0.0018), 7, 4),
+          mixTint([0.96, 0.8, 0.58], [0.34, 0.22, 0.18], decay * 0.7),
+        ),
+      );
     }
     const thumbBase = tip.clone().add(new Vector3(sign * 0.022, 0.026, -0.006));
-    const thumbMid = thumbBase.clone().add(new Vector3(sign * 0.008, -0.019, -0.017));
-    const thumbEnd = thumbMid.clone().add(new Vector3(sign * 0.002, -0.014, -0.018));
+    const thumbMid = thumbBase.clone().add(new Vector3(sign * 0.008, -0.019 * fingerCurl, -0.017 * fingerCurl));
+    const thumbEnd = thumbMid.clone().add(new Vector3(sign * 0.002, -0.014 * fingerCurl, -0.018 * fingerCurl));
     digit(thumbBase, thumbMid, thumbEnd, 0.011, 0.009, 0.005);
+    skinParts.push(
+      tint(
+        ellipsoid(thumbEnd.clone().add(new Vector3(0, -0.001, -0.002)), new Vector3(0.005, 0.0028, 0.0019), 7, 4),
+        mixTint([0.96, 0.8, 0.58], [0.34, 0.22, 0.18], decay * 0.7),
+      ),
+    );
   }
 
   /* --- Legs ----------------------------------------------------------- */
@@ -1488,9 +1695,10 @@ function assemble(rng: Rng, seed: number, opts: { bulk?: number; height?: number
   }
 
   ensureTints(skinParts);
-  const skinGeo = mergeAll(skinParts, ['color'])!;
+  let skinGeo = mergeAll(skinParts, ['color'])!;
   skinParts.forEach((g) => g.dispose());
   skinGeo.computeVertexNormals();
+  let woundGeo: BufferGeometry | null = null;
   // Sagging, irregular flesh. Kept off the face, whose millimetre-scale inserts
   // have to stay registered with the cavities they sit in.
   // Ramped rather than switched at the jaw line: a hard boundary in a
@@ -1561,10 +1769,44 @@ function assemble(rng: Rng, seed: number, opts: { bulk?: number; height?: number
     // Anchored on the body surface, not the jacket's: the bruising has to reach
     // the flesh that is now showing through.
     const s = bodySectionAt(tearY, bulk, gauntMass);
-    wounds.push({
-      centre: new Vector3(Math.cos(tearAngle) * s.halfWidth, tearY, s.centreZ + Math.sin(tearAngle) * s.halfDepth),
-      radius: tearSize * 1.5,
-    });
+    // Match the tear anchor to the same rib/pec relief that the closed torso
+    // loft uses. Anchoring to the undeformed ellipse left the cavity partly
+    // behind the body at the sternum, flattening its depth in the depth buffer.
+    const relief = torsoRelief(tearY, tearAngle);
+    const tearCentre = new Vector3(
+      Math.cos(tearAngle) * (s.halfWidth + relief),
+      tearY,
+      s.centreZ + Math.sin(tearAngle) * (s.halfDepth + relief),
+    );
+    const tearNormal = new Vector3(Math.cos(tearAngle), 0, Math.sin(tearAngle)).normalize();
+    wounds.push({ centre: tearCentre.clone(), radius: tearSize * 1.5 });
+
+    // One merged wound patch: a raw, irregular rim falls into a darker inner
+    // wall, with one or two exposed rib arcs tucked into the floor. It is
+    // intentionally lifted a few millimetres from the closed torso because the
+    // latter remains the deformation and hit-test surface.
+    const cavityX = tearSize * rng.range(0.56, 0.76);
+    const cavityY = tearSize * rng.range(0.68, 0.96);
+    const cavityDepth = tearSize * rng.range(0.14, 0.22);
+    const cavityCentre = tearCentre.clone().addScaledVector(tearNormal, 0.006);
+    const woundParts: BufferGeometry[] = [
+      buildWoundCavity(cavityCentre, tearNormal, cavityX, cavityY, cavityDepth, seed),
+    ];
+    const tangent = new Vector3().crossVectors(tearNormal, new Vector3(0, 1, 0)).normalize();
+    const ribCount = decay > 0.58 || rng.chance(0.35) ? 2 : 1;
+    for (let rib = 0; rib < ribCount; rib++) {
+      const ribY = (rib - (ribCount - 1) * 0.5) * cavityY * 0.42;
+      const ribDepth = -cavityDepth * 0.28;
+      const points = [
+        cavityCentre.clone().addScaledVector(tangent, -cavityX * 0.56).addScaledVector(new Vector3(0, 1, 0), ribY + 0.004).addScaledVector(tearNormal, ribDepth),
+        cavityCentre.clone().addScaledVector(tangent, -cavityX * 0.08).addScaledVector(new Vector3(0, 1, 0), ribY + 0.009).addScaledVector(tearNormal, ribDepth - 0.001),
+        cavityCentre.clone().addScaledVector(tangent, cavityX * 0.5).addScaledVector(new Vector3(0, 1, 0), ribY - 0.002).addScaledVector(tearNormal, ribDepth),
+      ];
+      const ribGeo = sweep(points, () => [0.0036, 0.0023], 10, 5);
+      woundParts.push(tint(ribGeo, mixTint(BONE, RAW, 0.28 + decay * 0.22)));
+    }
+    woundGeo = mergeAll(woundParts, ['color'])!;
+    woundParts.forEach((g) => g.dispose());
   }
   // A corpse whose uniform survived intact reads as a soldier standing still,
   // not as a zombie, so anything that escaped the chest tear loses a shoulder.
@@ -1619,6 +1861,44 @@ function assemble(rng: Rng, seed: number, opts: { bulk?: number; height?: number
     },
   );
   if (jacket) clothParts.push(lockToTorso(jacket));
+
+  const seamTone = mixTint([0.82, 0.68, 0.46], [0.38, 0.31, 0.23], decay * 0.65);
+  const stitch = (points: Vector3[], tone: Tint = seamTone, width = 0.0022) => {
+    clothParts.push(tint(sweep(points, () => [width, width * 0.68], 10, 4), tone));
+  };
+
+  // Raised seam piping breaks the broad procedural jacket into sewn panels. It
+  // sits just outside the body-facing shell and is still skinned with the rest
+  // of the cloth, so it does not become a floating decal during animation.
+  for (const side of [-1, 1]) {
+    const y0 = jacketTopY - 0.012;
+    const y1 = P.chest.y + 0.06;
+    stitch([
+      new Vector3(side * 0.043 * bulk, y0, uniformFrontAt(y0) - 0.011),
+      new Vector3(side * 0.093 * bulk, y0 - 0.045, uniformFrontAt(y0 - 0.045) - 0.012),
+      new Vector3(side * 0.103 * bulk, y1, uniformFrontAt(y1) - 0.012),
+    ]);
+  }
+
+  if (chestTear) {
+    // A separate fray cord follows the hole's changing body radius. This adds a
+    // sewn thickness to the ragged grid edge and makes the jacket read as torn
+    // fabric with a lining, rather than as a missing texture rectangle.
+    const angularRadius = clamp(tearSize * 0.74 / Math.max(bodySectionAt(tearY, bulk, gauntMass).halfDepth, 0.001), 0.26, 0.7);
+    const edge: Vector3[] = [];
+    for (let i = 0; i <= 10; i++) {
+      const a = (i / 10) * TAU;
+      const y = tearY + Math.sin(a) * tearSize * 0.72;
+      const angle = tearAngle + Math.cos(a) * angularRadius;
+      const s = uniformSectionAt(y);
+      edge.push(new Vector3(
+        Math.cos(angle) * (s.halfWidth + 0.006),
+        y,
+        s.centreZ + Math.sin(angle) * (s.halfDepth + 0.006),
+      ));
+    }
+    stitch(edge, mixTint([0.7, 0.36, 0.22], [0.38, 0.18, 0.13], decay * 0.55), 0.0032);
+  }
 
   // Collar: a stand band around the neck plus two folded points lying back on
   // the chest, leaving a V at the throat. Both are sized off the neck rather
@@ -1686,6 +1966,11 @@ function assemble(rng: Rng, seed: number, opts: { bulk?: number; height?: number
       box(new Vector3(x, y, uniformFrontAt(y) - 0.008), 0.062 * bulk, 0.064, 0.016),
       box(new Vector3(x, y + 0.036, uniformFrontAt(y + 0.036) - 0.006), 0.067 * bulk, 0.016, 0.012),
     );
+    stitch([
+      new Vector3(x - side * 0.027 * bulk, y + 0.041, uniformFrontAt(y + 0.041) - 0.014),
+      new Vector3(x, y + 0.045, uniformFrontAt(y + 0.045) - 0.014),
+      new Vector3(x + side * 0.027 * bulk, y + 0.041, uniformFrontAt(y + 0.041) - 0.014),
+    ], seamTone, 0.0015);
   }
 
   // Shoulder yoke: the panel of the jacket that lies across each shoulder from
@@ -2076,6 +2361,14 @@ function assemble(rng: Rng, seed: number, opts: { bulk?: number; height?: number
     if (cap) gearParts.push(cap);
     const brim = headWorld(rimH(0), 0, 0.006, skullCentre);
     gearParts.push(box(new Vector3(brim.x, brim.y - 0.006, brim.z - 0.026), 0.112, 0.008, 0.054, 0, 0.14));
+  }
+
+  if (woundGeo) {
+    const combined = mergeAll([skinGeo, woundGeo], ['color'])!;
+    skinGeo.dispose();
+    woundGeo.dispose();
+    skinGeo = combined;
+    skinGeo.computeVertexNormals();
   }
 
   // Flesh colouring runs here rather than with the rest of the body, because

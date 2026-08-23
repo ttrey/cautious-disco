@@ -56,6 +56,11 @@ export const POINTS_HEADSHOT_KILL = 100;
  * optic. Deliberately small: the tube supplies the magnification.
  */
 const OPTIC_HOST_ZOOM = 1.1;
+/** Aim recoil is a shot/reticle offset, not a mutation of Player.pitch/yaw. */
+const AIM_RECOIL_RECOVERY_SCALE = 0.55;
+const AIM_RECOIL_COUNTERACTION = 1;
+const MAX_AIM_RECOIL_PITCH = Math.PI / 4;
+const MAX_AIM_RECOIL_YAW = Math.PI / 8;
 
 export class WeaponSystem {
   readonly slots: WeaponSlot[] = [];
@@ -70,6 +75,8 @@ export class WeaponSystem {
   private shotIndex = 0;
   private swapTimer = 0;
   private pendingSwap = -1;
+  private aimRecoilPitch = 0;
+  private aimRecoilYaw = 0;
   private readonly rng = new Rng(0x9f1e);
 
   /**
@@ -119,6 +126,7 @@ export class WeaponSystem {
     this.reloading = false;
     this.reloadTimer = 0;
     this.fireCooldown = 0;
+    this.resetAimRecoil();
     this.viewModel.equip(def);
   }
 
@@ -187,6 +195,7 @@ export class WeaponSystem {
       // Replace the weapon in hand, as the originals do.
       this.slots[this.activeIndex] = slot;
       this.viewModel.equip(def);
+      this.resetAimRecoil();
       this.swapTimer = def.swapTime;
       this.reloading = false;
     }
@@ -217,7 +226,11 @@ export class WeaponSystem {
     this.pendingSwap = index;
     this.swapTimer = this.active.def.swapTime * 0.45;
     this.reloading = false;
-    this.viewModel.cancelReload();
+    this.reloadTimer = 0;
+    this.fireCooldown = 0;
+    this.pumpTimer = 0;
+    this.resetAimRecoil();
+    this.viewModel.startLower();
   }
 
   private beginReload() {
@@ -277,6 +290,31 @@ export class WeaponSystem {
     return (degrees * Math.PI) / 180;
   }
 
+  /**
+   * Lets deliberate mouse counter-steering settle the shot offset without
+   * moving the world camera. Looking down (`lookY > 0`) therefore cancels an
+   * upward climb, but ordinary mouse motion cannot create a second recoil
+   * impulse after the offset reaches zero.
+   */
+  private updateAimRecoil(dt: number) {
+    const rec = this.active.def.recoil;
+    this.aimRecoilPitch = this.counteractRecoil(this.aimRecoilPitch, this.input.lookY * AIM_RECOIL_COUNTERACTION);
+    this.aimRecoilYaw = this.counteractRecoil(this.aimRecoilYaw, this.input.lookX * AIM_RECOIL_COUNTERACTION);
+    this.aimRecoilPitch = damp(this.aimRecoilPitch, 0, rec.recovery * AIM_RECOIL_RECOVERY_SCALE, dt);
+    this.aimRecoilYaw = damp(this.aimRecoilYaw, 0, rec.recovery * AIM_RECOIL_RECOVERY_SCALE, dt);
+  }
+
+  private counteractRecoil(value: number, correction: number) {
+    if (value === 0 || correction === 0 || Math.sign(value) !== Math.sign(correction)) return value;
+    const remaining = Math.abs(value) - Math.abs(correction);
+    return remaining <= 0 ? 0 : Math.sign(value) * remaining;
+  }
+
+  private resetAimRecoil() {
+    this.aimRecoilPitch = 0;
+    this.aimRecoilYaw = 0;
+  }
+
   private fire(camera: PerspectiveCamera, moveIntensity: number, crouching: boolean) {
     const slot = this.active;
     const def = slot.def;
@@ -294,7 +332,14 @@ export class WeaponSystem {
 
     camera.getWorldPosition(_origin);
     camera.getWorldDirection(_dir);
+    _up.set(0, 1, 0).applyQuaternion(camera.quaternion).normalize();
     _right.crossVectors(_dir, _up).normalize();
+    // Recoil follows the shot and reticle only. The camera's quaternion stays
+    // on the player's actual mouse aim, so firing cannot tilt the whole world.
+    _dir
+      .addScaledVector(_up, Math.tan(this.aimRecoilPitch))
+      .addScaledVector(_right, Math.tan(this.aimRecoilYaw))
+      .normalize();
     // Tracers are drawn from the muzzle, not the eye — a round that leaves the
     // bridge of your nose reads as a bug even when the hit is correct.
     this.viewModel.muzzleWorld(camera, _muzzle);
@@ -405,6 +450,17 @@ export class WeaponSystem {
       this.onPointsEarned?.(points, kills > 0 ? (headshots > 0 ? 'headshot' : 'kill') : 'hit');
     }
 
+    const recoilWander = Math.sin(this.shotIndex * 2.399) * 0.6;
+    this.aimRecoilPitch = clamp(
+      this.aimRecoilPitch + (def.recoil.vertical * Math.PI) / 180 * this.recoilMultiplier,
+      -MAX_AIM_RECOIL_PITCH,
+      MAX_AIM_RECOIL_PITCH,
+    );
+    this.aimRecoilYaw = clamp(
+      this.aimRecoilYaw + (def.recoil.horizontal * (recoilWander + def.recoil.drift) * Math.PI) / 180 * this.recoilMultiplier,
+      -MAX_AIM_RECOIL_YAW,
+      MAX_AIM_RECOIL_YAW,
+    );
     this.viewModel.fire(def, this.shotIndex);
     if (def.wonder) this.audio.wonderShot(def.wonder.kind);
     else this.audio.gunshot(def.audio);
@@ -432,12 +488,14 @@ export class WeaponSystem {
     this.fireCooldown = Math.max(0, this.fireCooldown - dt);
     this.pumpTimer = Math.max(0, this.pumpTimer - dt);
     this.swapTimer = Math.max(0, this.swapTimer - dt);
+    this.updateAimRecoil(dt);
 
     // Deferred swap so the lower animation has time to play.
     if (this.pendingSwap >= 0 && this.swapTimer <= 0) {
       this.activeIndex = this.pendingSwap;
       this.pendingSwap = -1;
       this.viewModel.equip(this.active.def);
+      this.resetAimRecoil();
       this.swapTimer = this.active.def.swapTime;
       this.audio.mechanical(1.3, 0.22);
     }
@@ -523,19 +581,19 @@ export class WeaponSystem {
     }
   }
 
-  /** View punch the camera should apply and then decay, in radians. */
-  consumeViewPunch(dt: number): { pitch: number; yaw: number } {
-    const pitch = this.viewModel.viewPunchPitch * this.recoilMultiplier;
-    const yaw = this.viewModel.viewPunchYaw * this.recoilMultiplier;
-    // The viewmodel decays its own copy; the camera integrates the difference.
-    // Damping only the camera's share is deliberate — Deadshot should steady
-    // the *sight picture*, not stop the weapon itself from kicking, which is
-    // the animation the shot reads from.
-    return { pitch: pitch * Math.min(1, dt * 26), yaw: yaw * Math.min(1, dt * 26) };
-  }
-
   get aimBlend() {
     return this.viewModel.adsBlend;
+  }
+
+  /** Screen-space recoil offset for the HUD reticle, in CSS pixels. */
+  crosshairRecoil(camera: PerspectiveCamera) {
+    const viewportHeight = typeof window === 'undefined' ? 0 : window.innerHeight;
+    if (viewportHeight <= 0) return { x: 0, y: 0 };
+    const pixelsPerTangent = viewportHeight / (2 * Math.tan((camera.fov * Math.PI) / 360));
+    return {
+      x: Math.tan(this.aimRecoilYaw) * pixelsPerTangent,
+      y: -Math.tan(this.aimRecoilPitch) * pixelsPerTangent,
+    };
   }
 
   /**

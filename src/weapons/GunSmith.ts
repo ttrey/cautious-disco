@@ -543,6 +543,31 @@ function pin(x: number, y: number, z: number, radius: number, len = 0.0022): Buf
 }
 
 /**
+ * External thread relief turned onto a barrel tenon: fine annular rings at a
+ * real thread pitch, marching back (+Z) from the front ring.
+ *
+ * Muzzle devices screw onto *cut* threads, so a stretch of bare tenon ahead of
+ * the device should ripple. Even at viewmodel distance that regular ripple is
+ * what separates "machined barrel" from "dowel rod". Each ring is deliberately
+ * fatter than the tenon it serves and overlaps it, so every ring physically
+ * bites the barrel rather than floating beside it.
+ */
+function threads(
+  y: number,
+  zFront: number,
+  count: number,
+  radius: number,
+  pitch = 0.0055,
+  ringLen = 0.0018,
+): BufferGeometry[] {
+  const out: BufferGeometry[] = [];
+  for (let i = 0; i < count; i++) {
+    out.push(place(rod(radius, ringLen, 14), 0, y, zFront + i * pitch));
+  }
+  return out;
+}
+
+/**
  * Curved box magazine, swept as one solid.
  *
  * Built as a single lofted body following an arc rather than a stack of rotated
@@ -1009,10 +1034,29 @@ function marker(name: string, x: number, y: number, z: number): Object3D {
 
 export function buildPistol(): GunModel {
   const root = new Group();
-  const steel = Presets.gunSteel();
+  const steel = Presets.gunSteel(0x393d42);
+  const slideSteel = makeSurface('gunmetal', {
+    repeat: 1,
+    tint: 0x34383d,
+    roughness: 0.84,
+    metalness: 0.92,
+    normalScale: 0.52,
+  });
   const bright = Presets.brightSteel();
-  const poly = Presets.gunPolymer();
+  const poly = Presets.gunPolymer(0x24272a);
   const dark = Presets.gunSteel(0x161616);
+  // The 92's frame is aluminium alloy under its polymer grip panels. Giving
+  // the frame its own lighter, softer-lit surface — rather than sharing the
+  // slide's dark parkerising — splits the gun into three planes: steel slide,
+  // alloy frame, polymer grip. One tint across all of them reads as a single
+  // moulding, which is exactly what this pattern never is.
+  const frameAlloy = makeSurface('gunmetal', {
+    repeat: 1,
+    tint: 0x474d55,
+    roughness: 0.78,
+    metalness: 0.82,
+    normalScale: 0.58,
+  });
 
   // Bore on the weapon's own zero; everything else is measured off it.
   const BORE = 0.0;
@@ -1041,8 +1085,8 @@ export function buildPistol(): GunModel {
 
   const slideSection = (w: number) => rrect(w, SLIDE_H, 0.0055, 0, SLIDE_MID);
   sk.add(
-    'steel',
-    steel,
+    'slideSteel',
+    slideSteel,
     place(extrudeZ(slideSection(SLIDE_W), BREECH_BACK - BREECH_FRONT), 0, 0, (BREECH_BACK + BREECH_FRONT) / 2),
     place(extrudeZ(slideSection(SLIDE_W), PORT_FRONT - MUZZLE_BLOCK), 0, 0, (PORT_FRONT + MUZZLE_BLOCK) / 2),
   );
@@ -1060,38 +1104,83 @@ export function buildPistol(): GunModel {
   const openLen = BREECH_FRONT - PORT_FRONT;
   const openMid = (BREECH_FRONT + PORT_FRONT) / 2;
   const WALL_W = 0.0045;
-  for (const side of [-1, 1]) {
-    sk.add(
-      'steel',
-      steel,
-      place(
-        extrudeZ(
-          rrect(WALL_W, SLIDE_H, 0.0018, (side * (SLIDE_W - WALL_W)) / 2, SLIDE_MID),
-          openLen,
-        ),
-        0,
-        0,
-        openMid,
-      ),
-    );
-  }
+  // One wall extrusion helper: a thin rrect sheet at a rail station, run
+  // between two seam planes. Every wall piece below is authored through it so
+  // adjacent pieces share their butt planes exactly.
+  const WALL_X = (SLIDE_W - WALL_W) / 2;
+  const wallAt = (zA: number, zB: number, cy: number, h: number, cx: number) =>
+    place(extrudeZ(rrect(WALL_W, h, 0.0018, cx, cy), zA - zB), 0, 0, (zA + zB) / 2);
+
+  // Left wall runs the whole open section unbroken.
+  sk.add('slideSteel', slideSteel, wallAt(PORT_FRONT, BREECH_FRONT, SLIDE_MID, SLIDE_H, -WALL_X));
+
+  // Right wall is split around the ejection port so the opening is cut for
+  // real: full-height sheet behind the port, a low strip carrying only the
+  // wall below the port mouth, then full-height sheet again up to the breech
+  // block. On this pattern the case is thrown through the right rail beside
+  // the exposed barrel — a painted dark stripe on a closed wall reads as a
+  // sticker; three flush-butted extrusions with a genuine gap read as machining.
+  // The extrude bevel also leaves a hairline scribe at each butt joint, which
+  // is exactly how a port's cut edges should catch light.
+  const PORT_Z_BACK = -0.020;
+  const PORT_Z_FRONT = -0.048;
+  const PORT_FLOOR = BORE + 0.0035;
+  const PORT_TOP = SLIDE_TOP - 0.0025;
   sk.add(
-    'steel',
-    steel,
+    'slideSteel',
+    slideSteel,
+    wallAt(PORT_FRONT, PORT_Z_FRONT, SLIDE_MID, SLIDE_H, WALL_X),
+    // Low strip under the mouth: from the slide's bottom edge up to the floor.
+    wallAt(PORT_Z_FRONT, PORT_Z_BACK, (SLIDE_BOT + PORT_FLOOR) / 2, PORT_FLOOR - SLIDE_BOT, WALL_X),
+    wallAt(PORT_Z_BACK, BREECH_FRONT, SLIDE_MID, SLIDE_H, WALL_X),
+  );
+  const PORT_LEN = PORT_Z_BACK - PORT_Z_FRONT;
+
+  // Chamfered rims along the port's long edges: slim bright strips half-buried
+  // in the wall's outer face, protruding just enough to break the silhouette
+  // without reading as applied trim.
+  sk.add(
+    'bright',
+    bright,
+    place(box(0.0016, 0.0018, PORT_LEN, 0.0005), SLIDE_W / 2 - 0.0002, PORT_FLOOR - 0.0005, (PORT_Z_BACK + PORT_Z_FRONT) / 2),
+    place(box(0.0016, 0.0018, PORT_LEN, 0.0005), SLIDE_W / 2 - 0.0002, PORT_TOP + 0.0005, (PORT_Z_BACK + PORT_Z_FRONT) / 2),
+  );
+  sk.add(
+    'slideSteel',
+    slideSteel,
     place(extrudeZ(rrect(0.021, 0.009, 0.003, 0, SLIDE_BOT + 0.0045), openLen), 0, 0, openMid),
   );
 
   // Grasping serrations, rear block and front cocking cuts.
   sk.add(
-    'steel',
-    steel,
+    'slideSteel',
+    slideSteel,
     ...serrations(8, 0.0068, 0.048, SLIDE_W / 2 - 0.0004, SLIDE_MID + 0.001, SLIDE_H * 0.72, 0.0022, 0.2),
     ...serrations(4, 0.0068, -0.104, SLIDE_W / 2 - 0.0004, SLIDE_MID + 0.001, SLIDE_H * 0.72, 0.0022, 0.2),
   );
+  // A shallow top flat and two lower flats create the long highlight breaks of
+  // a forged Beretta slide without turning the hero mesh into a stack of slabs.
+  sk.add(
+    'slideSteel',
+    slideSteel,
+    place(box(0.018, 0.0015, 0.062, 0.00045), 0, SLIDE_TOP + 0.0010, 0.018),
+    place(box(0.020, 0.0012, 0.050, 0.00035), 0, SLIDE_BOT - 0.0008, -0.030),
+  );
   // Extractor, right side of the breech.
   sk.add('bright', bright, place(box(0.0035, 0.0075, 0.026, 0.0009), 0.0128, BORE + 0.006, 0.006));
+  // Dark extractor channel and a small witness pin keep the controls legible
+  // when the slide is held at the lower-right of the viewmodel.
+  sk.add(
+    'dark',
+    dark,
+    place(box(0.0012, 0.0060, 0.027, 0.00025), 0.0142, BORE + 0.006, 0.006),
+    place(new SphereGeometry(0.0012, 8, 6), -0.0141, BORE + 0.0070, 0.028),
+  );
   // Rear sight dovetail with a notch, front blade on the muzzle block.
   sk.add('steel', steel, place(box(0.020, 0.0075, 0.008, 0.0012), 0, SLIDE_TOP + 0.003, 0.046));
+  // Raised dovetail base under the blade: breaks the sight off the slide's
+  // top line and gives the notch crisp shoulders in silhouette.
+  sk.add('steel', steel, place(box(0.0240, 0.0022, 0.0100, 0.0006), 0, SLIDE_TOP + 0.0008, 0.046));
   sk.add('dark', dark, place(box(0.0032, 0.006, 0.009, 0.0004), 0, SLIDE_TOP + 0.0045, 0.046));
   sk.add('bright', bright, place(box(0.0032, 0.0072, 0.0042, 0.0006), 0, SLIDE_TOP + 0.0032, -0.130));
   // Front dot.
@@ -1129,6 +1218,17 @@ export function buildPistol(): GunModel {
     ),
   );
   sk.add('dark', dark, bore(0.0046, BORE + 0.0022, -0.1452, 0.026));
+  // Seen *through* the new port: the chamber's own sleeve, a hair fatter than
+  // the barrel so the eye reads it as a separate machined piece rotating in
+  // the opening, and a dark slab of lockwork behind it so the port shows depth
+  // instead of daylight. The sleeve is concentric over the barrel — a sleeve,
+  // not a collision — and the slab rests against the slide's under-bridge.
+  sk.add('bright', bright, place(rod(0.0080, 0.022, 16), 0, BORE + 0.0022, (PORT_Z_BACK + PORT_Z_FRONT) / 2));
+  sk.add(
+    'dark',
+    dark,
+    place(box(0.0045, 0.0075, PORT_LEN - 0.002, 0.0004), 0.0082, BORE - 0.0002, (PORT_Z_BACK + PORT_Z_FRONT) / 2),
+  );
   // Locking block lug under the chamber.
   sk.add('bright', bright, place(box(0.014, 0.010, 0.03, 0.0015), 0, BORE - 0.010, -0.02));
   sk.flushInto(slide, true);
@@ -1145,21 +1245,23 @@ export function buildPistol(): GunModel {
   const frame = new Group();
   const fk = new MeshKit();
 
-  // Dust cover with an accessory rail beneath it.
+  // Dust cover with an accessory rail beneath it. Frame metal, not slide
+  // metal — routed to the lighter alloy surface so the slide/frame joint
+  // reads across the whole gun, not just at the controls.
   fk.add(
-    'poly',
-    poly,
+    'alloy',
+    frameAlloy,
     place(extrudeZ(rrect(0.0235, 0.0165, 0.003, 0, BORE - 0.0205), 0.088), 0, 0, -0.054),
     place(extrudeZ(rrect(0.0165, 0.0062, 0.0012, 0, BORE - 0.0315), 0.05), 0, 0, -0.064),
   );
   for (let i = 0; i < 3; i++) {
-    fk.add('poly', poly, place(box(0.019, 0.0045, 0.0035, 0.0008), 0, BORE - 0.030, -0.048 - i * 0.0125));
+    fk.add('alloy', frameAlloy, place(box(0.019, 0.0045, 0.0035, 0.0008), 0, BORE - 0.030, -0.048 - i * 0.0125));
   }
 
   // Trigger housing / frame body under the breech.
   fk.add(
-    'poly',
-    poly,
+    'alloy',
+    frameAlloy,
     place(extrudeZ(rrect(0.0265, 0.021, 0.004, 0, BORE - 0.0225), 0.072), 0, 0, 0.020),
   );
 
@@ -1174,10 +1276,11 @@ export function buildPistol(): GunModel {
     { z: 0.0520, y: BORE - 0.1090, w: 0.0300, h: 0.0392, n: 5.0 },
   ];
   fk.add('poly', poly, loft(gripSections, 24));
-  // Beavertail sweeping up behind the hammer.
+  // Beavertail sweeping up behind the hammer — frame alloy like the rest of
+  // the frame forging.
   fk.add(
-    'poly',
-    poly,
+    'alloy',
+    frameAlloy,
     place(box(0.0225, 0.011, 0.030, 0.0045), 0, BORE - 0.0215, 0.0605, -0.22),
   );
 
@@ -1208,14 +1311,27 @@ export function buildPistol(): GunModel {
     );
   }
 
-  // Trigger guard, undercut at the front for a high grip.
-  fk.add('poly', poly, triggerGuard(-0.006, 0.028, BORE - 0.028, BORE - 0.0555, 0.0245, 0.0062));
+  // Trigger guard, undercut at the front for a high grip — alloy frame
+  // forging, like the housing it hangs from.
+  fk.add('alloy', frameAlloy, triggerGuard(-0.006, 0.028, BORE - 0.028, BORE - 0.0555, 0.0245, 0.0062));
+  // Fillet bosses where the guard's struts dive under the housing: real
+  // frames grow a web of extra metal at exactly these joints, and the two low
+  // wedges catch rim light across what would otherwise be a bare T-junction.
+  fk.add(
+    'alloy',
+    frameAlloy,
+    place(box(0.0110, 0.0060, 0.0090, 0.0014), 0, BORE - 0.0345, -0.0060),
+    place(box(0.0110, 0.0060, 0.0090, 0.0014), 0, BORE - 0.0345, 0.0280),
+  );
 
   // Controls: magazine release, slide stop, takedown lever.
   fk.add('bright', bright, place(barrel(0.0048, 0.0048, 0.0055, 12), 0.0145, BORE - 0.032, 0.018, 0, Math.PI / 2, 0));
   fk.add('bright', bright, place(box(0.0038, 0.008, 0.026, 0.0012), -0.0145, BORE - 0.016, 0.010));
   fk.add('bright', bright, place(barrel(0.0055, 0.0055, 0.0042, 12), -0.0145, BORE - 0.0165, -0.014, 0, Math.PI / 2, 0));
   fk.add('bright', bright, ...pin(0.0135, BORE - 0.021, 0.0345, 0.0022));
+  // Hammer/sear pivot behind the takedown pin: paired pin heads are what make
+  // a frame flank read as drilled metal rather than as moulded plastic.
+  fk.add('bright', bright, ...pin(0.0135, BORE - 0.021, 0.0490, 0.0019));
 
   // Hammer spur, standing proud behind the slide.
   fk.add('bright', bright, place(box(0.0075, 0.019, 0.0075, 0.0022), 0, BORE + 0.002, 0.0645, 0.36));
@@ -1281,9 +1397,15 @@ export function buildPistol(): GunModel {
 
 export function buildSmg(): GunModel {
   const root = new Group();
-  const steel = Presets.gunSteel();
+  // Stamped receiver sheet is the darkest plane; the cocking tube is a
+  // separate welded assembly a step lighter; and the two mouldings — furniture
+  // versus trigger-group housing — carry distinct tints so the gun reads as
+  // assembled from parts, not as one injection-moulded blob.
+  const steel = Presets.gunSteel(0x31353a);
+  const tubeSteel = Presets.gunSteel(0x3c4148);
   const bright = Presets.brightSteel();
-  const poly = Presets.gunPolymer();
+  const poly = Presets.gunPolymer(0x222427);
+  const tgPoly = Presets.gunPolymer(0x2c2f34);
   const dark = Presets.gunSteel(0x151515);
 
   const BORE = 0.004;
@@ -1315,18 +1437,50 @@ export function buildSmg(): GunModel {
   );
   // Bolt face visible in the port.
   kit.add('bright', bright, place(box(0.010, 0.020, 0.042, 0.0018), 0.0085, BORE - 0.001, -0.004));
+  // Chamfered rims top and bottom of the port opening: slim bright strips
+  // half-buried in the right flank, protruding under a millimetre. They break
+  // the port's edges the way a machined chamfer does, without reading as
+  // applied trim.
+  kit.add(
+    'bright',
+    bright,
+    place(box(0.0016, 0.0018, PORT_BACK - PORT_FRONT + 0.003, 0.0005), 0.0188, BORE - 0.0106, (PORT_BACK + PORT_FRONT) / 2),
+    place(box(0.0016, 0.0018, PORT_BACK - PORT_FRONT + 0.003, 0.0005), 0.0188, BORE + 0.0076, (PORT_BACK + PORT_FRONT) / 2),
+  );
 
   // Cocking tube along the upper left, ending in the classic forward dogleg.
-  kit.add('steel', steel, place(rod(0.0108, 0.190, 18), -0.0182, BORE + 0.0175, -0.108));
+  // A step lighter than the receiver: it is a separate welded assembly on the
+  // real gun, and the tonal split is what keeps it legible as its own part.
+  kit.add('tube', tubeSteel, place(rod(0.0108, 0.190, 18), -0.0182, BORE + 0.0175, -0.108));
   kit.add(
-    'steel',
-    steel,
+    'tube',
+    tubeSteel,
     place(box(0.0225, 0.0155, 0.030, 0.005), -0.0205, BORE + 0.0175, -0.196, 0, 0, 0),
   );
   // Weld seam / receiver ribs.
-  for (const z of [0.05, -0.06]) {
-    kit.add('steel', steel, place(extrudeZ(recvSection(1.045), 0.006, 0.0012), 0, 0, z));
-  }
+  //
+  // Sharpened: the old wide soft bands (1.045 scale over 6 mm) read as bulges,
+  // not press-work. Stamped receivers show as thin, hard raised lines, so each
+  // rib is now a narrow tight ring — and two more sit close against the
+  // ejection port edges, where the real gun's sheet is spot-welded, so the
+  // port reads as cut into seamed metal rather than punched into a blank.
+  const SEAM_SCALE = 1.02;
+  const SEAM_D = 0.0032;
+  kit.add(
+    'steel',
+    steel,
+    ...[0.05, -0.06, PORT_BACK + 0.004, PORT_FRONT - 0.004].map((z) =>
+      place(extrudeZ(recvSection(SEAM_SCALE), SEAM_D, 0.0008), 0, 0, z),
+    ),
+  );
+  // Folded top edge: the spine of a stamped tube carries a visible seam where
+  // the sheet closes. A slim bright hairline, half-buried along the receiver
+  // crown, catches the key light as a crisp line the full length of the gun.
+  kit.add(
+    'bright',
+    bright,
+    place(box(0.0022, 0.0013, RECV_BACK - RECV_FRONT + 0.004, 0.0004), 0, BORE + 0.0197, (RECV_BACK + RECV_FRONT) / 2),
+  );
 
   /* --- Handguard ------------------------------------------------------- */
   kit.add(
@@ -1348,6 +1502,20 @@ export function buildSmg(): GunModel {
   }
   // Sling loop under the front of the handguard.
   kit.add('steel', steel, place(new TorusGeometry(0.0072, 0.0018, 8, 16), 0, BORE - 0.026, -0.234, 0, Math.PI / 2, 0));
+  // Barrel shroud cooling holes: two staggered rows of recesses down each
+  // flank of the forend, over the bore line. The dark boxes sit half-buried in
+  // the surface (same trick as the SPAS-12 shroud slots) so each hole carries a
+  // genuine shadowed recess instead of a painted dot; the stagger breaks up the
+  // long blank flank that made the forend read as an undecorated bar.
+  for (let i = 0; i < 4; i++) {
+    const z = -0.131 - i * 0.031;
+    // Forend half-width at this station, tracked off the loft sections above.
+    const hw = i === 3 ? 0.0186 : i === 2 ? 0.02 : 0.0207;
+    for (const side of [-1, 1]) {
+      kit.add('dark', dark, place(box(0.006, 0.0052, 0.0125, 0.001), side * (hw + 0.001), BORE - 0.001, z));
+      kit.add('dark', dark, place(box(0.006, 0.0046, 0.0095, 0.001), side * (hw + 0.0009), BORE - 0.0135, z - 0.010));
+    }
+  }
 
   /* --- Barrel and muzzle ----------------------------------------------- */
   kit.add('bright', bright, place(rod(0.0088, 0.070, 20), 0, BORE, -0.246));
@@ -1380,6 +1548,10 @@ export function buildSmg(): GunModel {
       place(box(0.0055, 0.0055, 0.010, 0.0012), Math.cos(a) * 0.0115, BORE + Math.sin(a) * 0.0115, -0.266),
     );
   }
+  // Thread relief on the tenon the lug adapter screws onto: the bare barrel
+  // stretch between handguard and adapter carries cut threads on the real
+  // gun, and the ripple is what stops it reading as dowel rod.
+  kit.add('steel', steel, ...threads(BORE, -0.2535, 3, 0.0096));
   kit.add('dark', dark, bore(0.0052, BORE, -0.2825, 0.028));
 
   /* --- Sights ----------------------------------------------------------
@@ -1406,10 +1578,23 @@ export function buildSmg(): GunModel {
   kit.add('dark', dark, place(tube(0.0030, 0.0016, 0.008, 16), 0, SIGHT_Y, 0.030));
 
   /* --- Grip and trigger group ------------------------------------------ */
+  // The trigger-group housing is its own moulding, a step lighter than the
+  // furniture polymer — on the real gun the two never match, and that mismatch
+  // is what makes the housing read as a removable pack.
   kit.add(
-    'poly',
-    poly,
+    'tg',
+    tgPoly,
     place(extrudeZ(rrect(0.0300, 0.0230, 0.005, 0, BORE - 0.0335), 0.100), 0, 0, 0.026),
+  );
+  // Magazine-release paddle behind the well (left hand) and its push button
+  // (right): this pattern's signature control, and the reason its reloads rock
+  // the magazine straight out. Both are embedded in the housing's flanks so
+  // they pivot from real material rather than floating beside it.
+  kit.add(
+    'bright',
+    bright,
+    place(box(0.0045, 0.0110, 0.0160, 0.0012), -0.0168, BORE - 0.0390, -0.0205, 0.22),
+    place(barrel(0.0052, 0.0052, 0.0050, 12), 0.0168, BORE - 0.0390, -0.0225, 0, Math.PI / 2, 0),
   );
   kit.add(
     'poly',
@@ -1449,6 +1634,10 @@ export function buildSmg(): GunModel {
     kit.add('bright', bright, place(box(0.0035, 0.0075, 0.0195, 0.0012), side * 0.0172, BORE - 0.0300, 0.0570));
   }
   kit.add('bright', bright, ...pin(0.0155, BORE - 0.0235, -0.0060, 0.0028));
+  // Butt-cap retaining pin where the retractable stock bridges the receiver
+  // tail: a stamped receiver is held together by visible cross-pins, and one
+  // more head here keeps the rear third of the gun from reading as blank.
+  kit.add('bright', bright, ...pin(0.0170, BORE - 0.0015, 0.0660, 0.0026));
 
   /* --- Retractable stock ----------------------------------------------- */
   for (const side of [-1, 1]) {
@@ -1478,14 +1667,22 @@ export function buildSmg(): GunModel {
       Presets.gunSteel(0x7f8187),
       // Curls toward the muzzle: a box magazine's concave face points forward,
       // and a rearward curl reads as the magazine being in backwards.
+      //
+      // The sweep itself is the MP40's silhouette signature — a long,
+      // distinctly banana-curved 9mm column, not the near-straight slab the
+      // old -0.30 rad / 126 mm build produced (at hip distance that read as a
+      // plain box). Lengthened toward the real ~265 mm column and the total
+      // sweep doubled so the curve survives being seen edge-on at rest; the
+      // extra taper keeps the floorplate visibly narrower than the mouth,
+      // which is what sells the curvature even when only the spine shows.
       ...curvedMagazine({
         z: -0.042,
         y: BORE - 0.020,
-        length: 0.126,
+        length: 0.150,
         width: 0.0230,
         depth: 0.0330,
-        curve: -0.30,
-        taper: 0.06,
+        curve: -0.62,
+        taper: 0.1,
       }),
     )
     .flushInto(magazine);
@@ -1533,9 +1730,21 @@ export function buildSmg(): GunModel {
 
 export function buildRifle(): GunModel {
   const root = new Group();
-  const steel = Presets.gunSteel();
+  // Split the airframe into three material families so every joint reads:
+  // hard anodised aluminium for the flat-top upper and its handguard, matte
+  // polymer for everything moulded below it, parkerised steel for the moving
+  // bits. One tint across the whole receiver is what makes a rifle read as a
+  // toy blank rather than as an assembly.
+  const alu = makeSurface('gunmetal', {
+    repeat: 1,
+    tint: 0x2f343b,
+    roughness: 0.74,
+    metalness: 0.9,
+    normalScale: 0.55,
+  });
+  const steel = Presets.gunSteel(0x3a3e44);
   const bright = Presets.brightSteel();
-  const poly = Presets.gunPolymer();
+  const poly = Presets.gunPolymer(0x212327);
   const dark = Presets.gunSteel(0x141414);
   const body = new Group();
   const kit = new MeshKit();
@@ -1568,22 +1777,31 @@ export function buildRifle(): GunModel {
   const portSection = notchFlank(upperSection, BORE - 0.0120, BORE + 0.0040, 0.0075);
 
   kit.add(
-    'poly',
-    poly,
+    'alu',
+    alu,
     place(extrudeZ(upperSection, UPPER_BACK - PORT_BACK), 0, 0, (UPPER_BACK + PORT_BACK) / 2),
     place(extrudeZ(portSection, PORT_BACK - PORT_FRONT, 0.0012), 0, 0, (PORT_BACK + PORT_FRONT) / 2),
     place(extrudeZ(upperSection, PORT_FRONT - UPPER_FRONT), 0, 0, (PORT_FRONT + UPPER_FRONT) / 2),
   );
-  kit.add('poly', poly, ...rail(UPPER_BACK - UPPER_FRONT - 0.006, 0.0215, UPPER_BACK - 0.003, BORE + 0.0205));
+  kit.add('alu', alu, ...rail(UPPER_BACK - UPPER_FRONT - 0.006, 0.0215, UPPER_BACK - 0.003, BORE + 0.0205));
 
-  // Brass deflector and forward assist on the right, behind the port.
-  kit.add('poly', poly, place(box(0.0125, 0.0165, 0.0245, 0.005), 0.0205, BORE + 0.0055, 0.0135));
-  kit.add('poly', poly, place(barrel(0.0072, 0.0072, 0.0165, 12), 0.0215, BORE - 0.0045, 0.0225, 0, Math.PI / 2, 0));
+  // Brass deflector and forward assist on the right, behind the port —
+  // aluminium, machined into the upper forging.
+  kit.add('alu', alu, place(box(0.0125, 0.0165, 0.0245, 0.005), 0.0205, BORE + 0.0055, 0.0135));
+  kit.add('alu', alu, place(barrel(0.0072, 0.0072, 0.0165, 12), 0.0215, BORE - 0.0045, 0.0225, 0, Math.PI / 2, 0));
   kit.add('bright', bright, place(barrel(0.0045, 0.0045, 0.0055, 10), 0.0300, BORE - 0.0045, 0.0225, 0, Math.PI / 2, 0));
   // Ejection port cover, hinged shut below the opening.
   kit.add('steel', steel, place(box(0.0040, 0.0150, 0.0430, 0.0014), 0.0192, BORE - 0.0190, 0.0035));
+  // Chamfered rims along the port's long edges, same treatment as the SMG's:
+  // half-buried bright strips that break the opening's silhouette.
+  kit.add(
+    'alu',
+    alu,
+    place(box(0.0016, 0.0018, PORT_BACK - PORT_FRONT + 0.003, 0.0005), 0.0192, BORE - 0.0124, (PORT_BACK + PORT_FRONT) / 2),
+    place(box(0.0016, 0.0018, PORT_BACK - PORT_FRONT + 0.003, 0.0005), 0.0192, BORE + 0.0044, (PORT_BACK + PORT_FRONT) / 2),
+  );
   // Charging-handle raceway shroud at the tail.
-  kit.add('poly', poly, place(box(0.0300, 0.0100, 0.0180, 0.0028), 0, BORE + 0.0175, 0.0665));
+  kit.add('alu', alu, place(box(0.0300, 0.0100, 0.0180, 0.0028), 0, BORE + 0.0175, 0.0665));
 
   /* --- Lower receiver --------------------------------------------------- */
   kit.add(
@@ -1708,12 +1926,16 @@ export function buildRifle(): GunModel {
     return pts;
   };
   kit.add(
-    'poly',
-    poly,
+    'alu',
+    alu,
     place(extrudeZ(roundedPoly(oct(1), 0.0032), HG_BACK - HG_FRONT), 0, 0, (HG_BACK + HG_FRONT) / 2),
   );
   // Barrel-nut collar where the handguard clamps to the upper.
-  kit.add('poly', poly, place(extrudeZ(roundedPoly(oct(1.09), 0.004), 0.016), 0, 0, -0.104));
+  kit.add('alu', alu, place(extrudeZ(roundedPoly(oct(1.09), 0.004), 0.016), 0, 0, -0.104));
+  // Delta ring behind the nut: a real upper carries a round slip-ring here,
+  // and covering the joint between two material families with a turned
+  // torus beats leaving a raw seam between extrusions.
+  kit.add('alu', alu, place(new TorusGeometry(0.0255, 0.0030, 10, 24), 0, BORE + 0.0015, -0.099));
   // M-LOK slots at 3, 6 and 9 o'clock.
   for (let i = 0; i < 6; i++) {
     const z = -0.128 - i * 0.0225;
@@ -1722,12 +1944,18 @@ export function buildRifle(): GunModel {
     }
     kit.add('dark', dark, place(box(0.0135, 0.0055, 0.0155, 0.0022), 0, BORE - 0.0205, z));
   }
-  kit.add('poly', poly, ...rail(0.150, 0.0215, HG_BACK - 0.004, BORE + 0.0205));
+  kit.add('alu', alu, ...rail(0.150, 0.0215, HG_BACK - 0.004, BORE + 0.0205));
 
   /* --- Barrel, gas system and muzzle device ----------------------------- */
   kit.add('bright', bright, place(rod(0.0092, 0.060, 20), 0, BORE, -0.126));
   kit.add('bright', bright, place(rod(0.0072, 0.180, 20), 0, BORE, -0.242));
-  // Low-profile gas block plus the gas tube running back over the barrel.
+  // Thread relief on the muzzle tenon, in the bare stretch between gas block
+  // and birdcage: the device screws onto cut threads, and the ripple stops
+  // the exposed barrel reading as dowel rod.
+  kit.add('bright', bright, ...threads(BORE, -0.3085, 4, 0.0078));
+  // Low-profile gas block plus the gas tube running back over the barrel —
+  // the block is steel clamped to a steel barrel, so it stays with `steel`
+  // while the airframe around it is alloy.
   kit.add('steel', steel, place(extrudeZ(rrect(0.0175, 0.0230, 0.0030, 0, BORE + 0.0030), 0.0240), 0, 0, -0.2735));
   kit.add('bright', bright, place(rod(0.0026, 0.150, 10), 0, BORE + 0.0138, -0.204));
   // A2 birdcage.
@@ -1764,6 +1992,10 @@ export function buildRifle(): GunModel {
 
   /* --- Buffer tube and collapsible stock -------------------------------- */
   kit.add('steel', steel, place(rod(0.0152, 0.160, 20), 0, BORE + 0.0045, 0.1480));
+  // Castle nut clamping the receiver extension onto the tube: the visible
+  // ring between extension and stock, and the reason the tube doesn't look
+  // like it grew out of the lower.
+  kit.add('steel', steel, place(rod(0.0172, 0.010, 18), 0, BORE + 0.0045, 0.0940));
   kit.add('steel', steel, place(box(0.0330, 0.0135, 0.0170, 0.0035), 0, BORE - 0.0060, 0.0790));
   kit.add(
     'poly',
@@ -2412,11 +2644,19 @@ function forendShape(halfWidth: number, top: number, bottom: number, boreY: numb
 
 export function buildShotgun(): GunModel {
   const root = new Group();
-  const steel = Presets.gunSteel();
+  // Two steel tones: the receiver group blued dark, the barrel and magazine
+  // tube parkerised a step lighter. On a real pump gun the barrel is a
+  // separate part with its own finish, and that tonal split is what keeps the
+  // long top line from melting into one unbroken tube.
+  const steel = Presets.gunSteel(0x2e3136);
+  const barrelSteel = Presets.gunSteel(0x3b3f45);
   const bright = Presets.brightSteel();
   // Oil-finished walnut. The untinted bake is a pale ash that reads as bare
   // pine against parkerised steel.
   const wood = Presets.stockWood(0x8e6a47);
+  // The forend rides on its own dye lot, a touch warmer than the buttstock:
+  // two separately-oiled walnut pieces, never one continuous plank.
+  const forendWood = Presets.stockWood(0x99744f);
   const dark = Presets.gunSteel(0x171717);
   const body = new Group();
   const kit = new MeshKit();
@@ -2456,6 +2696,15 @@ export function buildShotgun(): GunModel {
     place(extrudeZ(portSection, PORT_BACK - PORT_FRONT, 0.0014), 0, 0, (PORT_BACK + PORT_FRONT) / 2),
     place(extrudeZ(recvSection, PORT_FRONT - RECV_FRONT), 0, 0, (PORT_FRONT + RECV_FRONT) / 2),
   );
+  // Chamfered rims along the port's long edges — the same half-buried bright
+  // strips the other receivers wear, sized up to this receiver's heavier
+  // milling so the opening's edges break light like machined chamfers.
+  kit.add(
+    'bright',
+    bright,
+    place(box(0.0018, 0.0020, PORT_BACK - PORT_FRONT + 0.003, 0.0005), 0.0231, RECV_CY - 0.0146, (PORT_BACK + PORT_FRONT) / 2),
+    place(box(0.0018, 0.0020, PORT_BACK - PORT_FRONT + 0.003, 0.0005), 0.0231, RECV_CY + 0.0066, (PORT_BACK + PORT_FRONT) / 2),
+  );
   // Barrel-extension boss: carries the receiver's section up onto the barrel so
   // the two meet on one axis instead of stepping.
   kit.add(
@@ -2476,12 +2725,15 @@ export function buildShotgun(): GunModel {
 
   /* --- Barrel and magazine tube ------------------------------------------ */
   // Chamber section steps down to the barrel proper, as a real one does.
-  kit.add('steel', steel, place(rod(0.0176, 0.0760, 22), 0, BORE, -0.1330));
-  kit.add('steel', steel, place(barrel(0.0140, 0.0176, 0.0120, 22), 0, BORE, -0.1770));
-  kit.add('steel', steel, place(rod(BARREL_R, 0.2520, 22), 0, BORE, -0.3090));
+  // `barrel()` puts radiusTop at the REAR face, so the cone runs fat-at-rear
+  // into the chamber and thin-at-front onto the barrel — inverted radii here
+  // once pinched a waist into the joint instead of a step.
+  kit.add('bsteel', barrelSteel, place(rod(0.0176, 0.0760, 22), 0, BORE, -0.1330));
+  kit.add('bsteel', barrelSteel, place(barrel(0.0176, 0.0140, 0.0120, 22), 0, BORE, -0.1770));
+  kit.add('bsteel', barrelSteel, place(rod(BARREL_R, 0.2520, 22), 0, BORE, -0.3090));
   kit.add(
-    'steel',
-    steel,
+    'bsteel',
+    barrelSteel,
     place(
       lathe(
         [
@@ -2501,9 +2753,29 @@ export function buildShotgun(): GunModel {
   );
   kit.add('dark', dark, bore(0.0102, BORE, -0.4448, 0.034));
 
-  kit.add('steel', steel, place(rod(TUBE_R, 0.2340, 20), 0, TUBE_Y, -0.2130));
+  /* --- Ventilated rib ----------------------------------------------------- */
+  // Twin rails riding the barrel's crown tangent, tied by cross posts: the
+  // classic pump-gun rib. It gives the long barrel a straight, regularly
+  // broken highlight line the naked tube lacks and carries the bead at a
+  // constant height. The rails sink 0.6 mm into the tube so they are welded
+  // on rather than floating over it, and the posts stop short of the bead
+  // seat so the two details never collide.
+  const RIB_Y = BORE + BARREL_R + 0.0003;
+  const RIB_BACK = -0.128;
+  const RIB_FRONT = -0.428;
+  kit.add(
+    'bsteel',
+    barrelSteel,
+    place(box(0.0022, 0.0018, RIB_BACK - RIB_FRONT, 0.0005), -0.0056, RIB_Y, (RIB_BACK + RIB_FRONT) / 2),
+    place(box(0.0022, 0.0018, RIB_BACK - RIB_FRONT, 0.0005), 0.0056, RIB_Y, (RIB_BACK + RIB_FRONT) / 2),
+  );
+  for (let i = 0; i < 11; i++) {
+    kit.add('bsteel', barrelSteel, place(box(0.0134, 0.0018, 0.0030, 0.0006), 0, RIB_Y, -0.134 - i * 0.027));
+  }
+
+  kit.add('bsteel', barrelSteel, place(rod(TUBE_R, 0.2340, 20), 0, TUBE_Y, -0.2130));
   // Knurled magazine cap with a sling stud.
-  kit.add('steel', steel, place(rod(0.0138, 0.0220, 20), 0, TUBE_Y, -0.3410));
+  kit.add('bsteel', barrelSteel, place(rod(0.0138, 0.0220, 20), 0, TUBE_Y, -0.3410));
   for (let i = 0; i < 12; i++) {
     const a = (i / 12) * Math.PI * 2;
     kit.add(
@@ -2514,8 +2786,8 @@ export function buildShotgun(): GunModel {
   }
   // Barrel-to-magazine clamp: one peanut-shaped collar around both tubes.
   kit.add(
-    'steel',
-    steel,
+    'bsteel',
+    barrelSteel,
     place(
       extrudeZ(
         roundedPoly(
@@ -2536,7 +2808,9 @@ export function buildShotgun(): GunModel {
   );
 
   /* --- Front bead -------------------------------------------------------- */
-  kit.add('steel', steel, place(box(0.0085, 0.0075, 0.0165, 0.0016), 0, BORE + 0.0140, -0.4160));
+  // Bead seat riding the rib, so the sight post stands on its own machined
+  // base between the rails instead of stuck to a bare tube.
+  kit.add('bsteel', barrelSteel, place(box(0.0085, 0.0075, 0.0165, 0.0016), 0, BORE + 0.0140, -0.4160));
   const BEAD_Y = BORE + 0.0205;
   kit.add('brass', Presets.brass(), place(new SphereGeometry(0.0034, 12, 10), 0, BEAD_Y, -0.4160));
 
@@ -2628,14 +2902,14 @@ export function buildShotgun(): GunModel {
   // wood standing proud on both flanks at the top of the cycle.
   const FOREND_Z = -0.2120;
   slideKit.add(
-    'wood',
-    wood,
+    'forend',
+    forendWood,
     place(extrudeZ(forendShape(0.0258, FOREND_TOP, FOREND_BOT, BORE, 0.0153), 0.1420, 0.0035), 0, 0, FOREND_Z),
   );
   for (let i = 0; i < 9; i++) {
     slideKit.add(
-      'wood',
-      wood,
+      'forend',
+      forendWood,
       place(
         extrudeZ(forendShape(0.0270, FOREND_TOP, FOREND_BOT - 0.0011, BORE, 0.0153), 0.0055, 0.0012),
         0,

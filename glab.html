@@ -4,16 +4,17 @@
     <meta charset="utf-8" />
     <title>Gun Lab — NECROPOLIS</title>
     <style>
-      html, body { margin: 0; height: 100%; background: #10131a; overflow: hidden; color: #cfd4dd;
+      html, body { margin: 0; height: 100%; background: #101820; overflow: hidden; color: #cfd4dd;
         font-family: system-ui, sans-serif; }
       #hud { position: fixed; top: 12px; left: 12px; z-index: 10; font-size: 13px; line-height: 1.6;
         background: rgba(0,0,0,.5); padding: 10px 14px; border-radius: 6px; }
       b { color: #ffb347; }
-      #reticle { position: fixed; left: 50%; top: 50%; width: 1px; height: 1px; z-index: 9;
-        box-shadow: 0 0 0 1px #ff2d2d; }
+      #reticle { position: fixed; left: 50%; top: 50%; width: 10px; height: 10px; z-index: 9;
+        transform: translate(-50%, -50%); border: 1px solid rgba(255,208,128,.7); border-radius: 50%;
+        box-shadow: 0 0 0 1px rgba(12,16,22,.45); pointer-events: none; }
       #reticle::before, #reticle::after { content: ''; position: fixed; background: rgba(255,45,45,.55); }
-      #reticle::before { left: 50%; top: 0; width: 1px; height: 100%; }
-      #reticle::after { top: 50%; left: 0; height: 1px; width: 100%; }
+      #reticle::before { left: 50%; top: -5px; width: 1px; height: 3px; background: rgba(255,208,128,.7); }
+      #reticle::after { top: 50%; left: 11px; height: 1px; width: 3px; background: rgba(255,208,128,.7); }
     </style>
   </head>
   <body>

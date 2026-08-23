@@ -57,14 +57,117 @@ const shared = <T>(build: () => T) => {
 };
 
 const plankMaterial = shared(() =>
-  makeSurface('woodPlank', { repeat: [1.6, 0.7], tint: 0x8f7f68, normalScale: 1 }),
+  makeSurface('woodPlank', {
+    repeat: [1.6, 0.7], tint: 0xb18d68, roughness: 0.88, metalness: 0.04, normalScale: 0.9,
+  }),
 );
 const doorWoodMaterial = shared(() =>
-  makeSurface('woodPlank', { repeat: [1.2, 0.8], tint: 0x9c8a72, normalScale: 0.9 }),
+  makeSurface('woodPlank', {
+    repeat: [1.2, 0.8], tint: 0xa88a68, roughness: 0.9, metalness: 0.04, normalScale: 0.85,
+  }),
 );
 const doorMetalMaterial = shared(() =>
   makeSurface('rustedMetal', { repeat: 2, tint: 0x8a8a90 }),
 );
+
+export interface TerminalSignOptions {
+  width?: number;
+  height?: number;
+  accent?: number;
+}
+
+/**
+ * A wall-mounted wayfinding sign for the terminal's authored landmarks.
+ *
+ * This is intentionally a visual prop rather than an Interactable: it has no
+ * collider, focus point, or nav footprint. Signs are mounted against existing
+ * walls or above door lintels, so they can add readable room identity without
+ * becoming invisible traversal geometry.
+ */
+export class TerminalSign {
+  readonly root = new Group();
+
+  constructor(
+    readonly title: string,
+    readonly subtitle: string,
+    position: Vector3,
+    yaw: number,
+    options: TerminalSignOptions = {},
+  ) {
+    const width = options.width ?? 3.8;
+    const height = options.height ?? 1.0;
+    const accent = options.accent ?? 0xe6b56b;
+    const backing = makeSurface('paintedMetal', {
+      repeat: 1.2,
+      tint: 0x252a2e,
+      roughness: 0.82,
+      metalness: 0.75,
+      normalScale: 0.7,
+    });
+    const frame = makeSurface('rustedMetal', {
+      repeat: 1.8,
+      tint: 0x777064,
+      roughness: 0.78,
+      metalness: 0.9,
+      normalScale: 0.55,
+    });
+    const accentMaterial = makeSurface('paintedMetal', {
+      repeat: 1,
+      tint: accent,
+      emissive: accent,
+      emissiveIntensity: 0.42,
+      roughness: 0.68,
+      metalness: 0.35,
+      normalScale: 0.25,
+    });
+
+    const body = new Mesh(new RoundedBoxGeometry(width, height, 0.14, 4, 0.035), backing);
+    body.position.y = height * 0.5;
+    body.castShadow = true;
+    body.receiveShadow = true;
+    this.root.add(body);
+
+    const barHeight = 0.065;
+    const top = new Mesh(new BoxGeometry(width * 0.92, barHeight, 0.055), frame);
+    top.position.set(0, height * 0.90, -0.09);
+    top.castShadow = true;
+    this.root.add(top);
+    const bottom = new Mesh(new BoxGeometry(width * 0.92, barHeight, 0.055), frame);
+    bottom.position.set(0, height * 0.10, -0.09);
+    bottom.castShadow = true;
+    this.root.add(bottom);
+    for (const side of [-1, 1]) {
+      const upright = new Mesh(new BoxGeometry(0.065, height * 0.82, 0.055), frame);
+      upright.position.set(side * width * 0.46, height * 0.5, -0.09);
+      upright.castShadow = true;
+      this.root.add(upright);
+    }
+
+    const lightBar = new Mesh(new BoxGeometry(width * 0.72, 0.035, 0.035), accentMaterial);
+    lightBar.position.set(0, height * 0.17, -0.13);
+    this.root.add(lightBar);
+
+    const signMat = new MeshBasicMaterial({
+      map: labelTexture([title, subtitle], {
+        width: 900,
+        height: 250,
+        color: '#ffe3ad',
+        size: 88,
+      }),
+      transparent: true,
+      toneMapped: false,
+      side: DoubleSide,
+    });
+    const label = new Mesh(new PlaneGeometry(width * 0.78, height * 0.54), signMat);
+    label.position.set(0, height * 0.58, -0.17);
+    label.rotation.y = Math.PI;
+    this.root.add(label);
+
+    this.root.name = `terminal_sign_${title.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`;
+    this.root.position.copy(position);
+    this.root.rotation.y = yaw;
+  }
+}
 
 export interface PromptContext {
   points: number;
@@ -536,6 +639,10 @@ export class MysteryBox implements Interactable {
     if (this.state === 'offering' && this.offer) {
       return { text: `Take ${this.offer.name}`, cost: 0, affordable: true };
     }
+    // Do not pin an impossible purchase to the centre of the opening frame.
+    // The box remains in the room as a readable landmark and becomes
+    // actionable as soon as the player has earned enough points.
+    if (ctx.points < this.cost) return null;
     return { text: 'Roll mystery box', cost: this.cost, affordable: ctx.points >= this.cost };
   }
 

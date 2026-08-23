@@ -10,10 +10,10 @@ import { Rng, clamp } from '../util/math';
  * shot is subtly different rather than the same wav retriggering, which is
  * what stops sustained automatic fire turning into a machine-gun buzz.
  *
- * Signal chain: sources → per-sound gain → optional panner → a shared
- * convolution reverb (generated impulse response) and a dry bus → master
- * compressor → destination. The compressor matters: without it, a shotgun and
- * six zombies at once clip hard.
+ * Signal chain: sources → per-sound gain → optional panner → a dry bus and,
+ * for world ambience and impacts, a shared convolution reverb (generated
+ * impulse response) → master compressor → destination. Weapon reports opt
+ * out of the wet bus so they stay immediate instead of echoing in the room.
  */
 
 export interface GunAudioSpec {
@@ -61,6 +61,8 @@ export class AudioEngine {
   private wet!: GainNode;
   private compressor!: DynamicsCompressorNode;
   private reverb!: ConvolverNode;
+  private roomFilter!: BiquadFilterNode;
+  private roomPreDelay!: DelayNode;
   private noiseBuffer!: AudioBuffer;
 
   private listenerPos = new Vector3();
@@ -99,8 +101,14 @@ export class AudioEngine {
     this.reverb = this.ctx.createConvolver();
     this.reverb.buffer = this.buildImpulse(2.4, 2.6);
     this.wet = this.ctx.createGain();
-    this.wet.gain.value = 0.34;
-    this.wet.connect(this.reverb);
+    this.wet.gain.value = 0.3;
+    this.roomFilter = this.ctx.createBiquadFilter();
+    this.roomFilter.type = 'lowpass';
+    this.roomFilter.frequency.value = 4600;
+    this.roomFilter.Q.value = 0.35;
+    this.roomPreDelay = this.ctx.createDelay(0.12);
+    this.roomPreDelay.delayTime.value = 0.014;
+    this.wet.connect(this.roomFilter).connect(this.roomPreDelay).connect(this.reverb);
     this.reverb.connect(this.master);
 
     this.noiseBuffer = this.buildNoise(2);
@@ -171,8 +179,14 @@ export class AudioEngine {
 
   /* --- Routing helpers ----------------------------------------------- */
 
-  /** Creates the output node for a sound, spatialised if a position is given. */
-  private out(position?: Vector3, refDistance = 4, maxDistance = 45): AudioNode {
+  /** Creates a spatialised output; `withReverb` is false for dry weapon cues. */
+  private out(
+    position?: Vector3,
+    refDistance = 4,
+    maxDistance = 45,
+    withReverb = true,
+    reverbSend = 1,
+  ): AudioNode {
     const ctx = this.ctx!;
     const gain = ctx.createGain();
     if (position) {
@@ -187,10 +201,18 @@ export class AudioEngine {
       panner.positionZ.value = position.z;
       gain.connect(panner);
       panner.connect(this.dry);
-      panner.connect(this.wet);
+      if (withReverb) {
+        const send = ctx.createGain();
+        send.gain.value = clamp(reverbSend, 0, 1);
+        panner.connect(send).connect(this.wet);
+      }
     } else {
       gain.connect(this.dry);
-      gain.connect(this.wet);
+      if (withReverb) {
+        const send = ctx.createGain();
+        send.gain.value = clamp(reverbSend, 0, 1);
+        gain.connect(send).connect(this.wet);
+      }
     }
     return gain;
   }
@@ -222,7 +244,10 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out(position, 6, 70) as GainNode;
+    // Keep the direct report dry and immediate, but give the room a restrained
+    // copy. A fully wet gunshot smears automatic fire; no room send at all
+    // makes a concrete interior feel like an anechoic test range.
+    const out = this.out(position, 6, 70, true, 0.24) as GainNode;
     out.gain.value = spec.gain;
 
     // Layer 1: the action — hammer fall, bolt, case mouth.
@@ -250,6 +275,21 @@ export class AudioEngine {
     click.connect(clickTone).connect(clickGain).connect(out);
     click.start(t);
     click.stop(t + clickFall * 2.2);
+
+    // A short band-limited muzzle snap fills the first millisecond without
+    // turning the action layer into a synthetic square-wave beep.
+    const snap = this.noiseSource(0.055, this.rng.range(0.92, 1.08));
+    const snapTone = ctx.createBiquadFilter();
+    snapTone.type = 'bandpass';
+    snapTone.Q.value = 2.2;
+    snapTone.frequency.setValueAtTime(action * 1.7, t);
+    snapTone.frequency.exponentialRampToValueAtTime(Math.max(260, action * 0.45), t + 0.035);
+    const snapGain = ctx.createGain();
+    snapGain.gain.setValueAtTime(0.0001, t);
+    snapGain.gain.exponentialRampToValueAtTime(0.5, t + 0.0015);
+    snapGain.gain.exponentialRampToValueAtTime(0.001, t + 0.042);
+    snap.connect(snapTone).connect(snapGain).connect(out);
+    snap.stop(t + 0.07);
 
     // Layer 2: the crack — bandpassed noise with a fast downward sweep.
     const noise = this.noiseSource(spec.tail + 0.2, this.rng.range(0.92, 1.1));
@@ -304,7 +344,7 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out() as GainNode;
+    const out = this.out(undefined, 4, 45, true, 0.14) as GainNode;
     out.gain.value = kind === 'plasma' ? 0.72 : 0.66;
 
     const body = ctx.createOscillator();
@@ -344,7 +384,7 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out() as GainNode;
+    const out = this.out(undefined, 4, 45, false) as GainNode;
     out.gain.value = 0.32;
     const osc = ctx.createOscillator();
     osc.type = 'square';
@@ -363,7 +403,7 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out() as GainNode;
+    const out = this.out(undefined, 4, 45, false) as GainNode;
     out.gain.value = level;
 
     const noise = this.noiseSource(0.14, pitch);
@@ -442,8 +482,24 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out(position, 4, 30) as GainNode;
+    const out = this.out(position, 4, 30, true, 0.72) as GainNode;
     out.gain.value = heavy ? 0.5 : 0.34;
+
+    // The noise reads as wet spray; this low, short body is what tells the ear
+    // that a heavy hit actually displaced mass instead of only making a hiss.
+    const body = ctx.createOscillator();
+    body.type = 'triangle';
+    body.frequency.setValueAtTime(heavy ? 118 : 168, t);
+    body.frequency.exponentialRampToValueAtTime(heavy ? 62 : 96, t + (heavy ? 0.18 : 0.11));
+    const bodyGain = ctx.createGain();
+    bodyGain.gain.setValueAtTime(heavy ? 0.72 : 0.38, t);
+    bodyGain.gain.exponentialRampToValueAtTime(0.001, t + (heavy ? 0.25 : 0.16));
+    const bodyTone = ctx.createBiquadFilter();
+    bodyTone.type = 'lowpass';
+    bodyTone.frequency.value = heavy ? 620 : 900;
+    body.connect(bodyTone).connect(bodyGain).connect(out);
+    body.start(t);
+    body.stop(t + (heavy ? 0.28 : 0.19));
 
     const noise = this.noiseSource(0.2, this.rng.range(0.7, 1.1));
     const lp = ctx.createBiquadFilter();
@@ -462,7 +518,7 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out(position, 4, 40) as GainNode;
+    const out = this.out(position, 4, 40, true, 0.9) as GainNode;
     out.gain.value = 0.2;
 
     const noise = this.noiseSource(0.16, this.rng.range(0.9, 1.3));
@@ -482,7 +538,7 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out() as GainNode;
+    const out = this.out(undefined, 4, 45, true, 0.25) as GainNode;
     out.gain.value = running ? 0.16 : 0.1;
     const noise = this.noiseSource(0.12, this.rng.range(0.8, 1.2));
     const bp = ctx.createBiquadFilter();
@@ -503,7 +559,7 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out(position, 3, 18) as GainNode;
+    const out = this.out(position, 3, 18, true, 0.62) as GainNode;
     out.gain.value = 0.34;
     const osc = ctx.createOscillator();
     osc.type = 'triangle';
@@ -575,7 +631,7 @@ export class AudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
     const t = ctx.currentTime;
-    const out = this.out() as GainNode;
+    const out = this.out(undefined, 4, 45, true, 0.38) as GainNode;
     out.gain.value = 0.42;
 
     const osc = ctx.createOscillator();
@@ -607,6 +663,15 @@ export class AudioEngine {
     bell.connect(bg).connect(out);
     bell.start(t);
     bell.stop(t + 2.3);
+
+    // The sweep establishes tension; the stepped motif makes the state change
+    // legible when the player is already surrounded by gunfire and groans.
+    this.arpeggio(
+      rising ? [110, 138.6, 164.8, 220] : [220, 164.8, 138.6, 110],
+      0.16,
+      'triangle',
+      rising ? 0.16 : 0.13,
+    );
   }
 
   private arpeggio(freqs: number[], step: number, type: OscillatorType, level: number) {
@@ -681,7 +746,7 @@ export class AudioEngine {
     const target = 0.16 * clamp(1 - amount, 0, 1);
     this.ambientGain.gain.cancelScheduledValues(t);
     this.ambientGain.gain.setTargetAtTime(target, t, 0.1);
-    this.ambientGain.gain.setTargetAtTime(0.16, t + seconds, 0.6);
+    this.ambientGain.gain.setTargetAtTime(0.16, t + clamp(seconds, 0.05, 5), 0.6);
   }
 
   setVolume(v: number) {

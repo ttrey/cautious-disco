@@ -27,21 +27,31 @@ import { clamp } from '../util/math';
 
 const CSS = `
 #nametags { position: fixed; inset: 0; pointer-events: none; z-index: 4; overflow: hidden;
-  font-family: 'Rajdhani','DIN Alternate','Oswald',system-ui,sans-serif; }
+  font-family: 'Arial Narrow','Avenir Next Condensed','Rajdhani',system-ui,sans-serif; }
 .nametag { position: absolute; left: 0; top: 0; transform-origin: 50% 100%;
   will-change: transform, opacity; transition: opacity .18s linear; }
-.nametag .inner { transform: translate(-50%, -100%); text-align: center; white-space: nowrap; }
-.nametag .name { font-size: 15px; font-weight: 700; letter-spacing: .1em; color: #efe6d4;
-  text-shadow: 0 0 8px rgba(0,0,0,.95), 0 2px 5px rgba(0,0,0,.9); text-transform: uppercase; }
-.nametag .bar { width: 62px; height: 3px; margin: 4px auto 0; border-radius: 2px;
-  background: rgba(0,0,0,.55); box-shadow: 0 0 5px rgba(0,0,0,.8); overflow: hidden; }
-.nametag .bar i { display: block; height: 100%; width: 100%; background: #6fd08a;
+.nametag .inner { transform: translate(-50%, -100%); min-width: 82px; padding: 4px 8px 5px; text-align: center;
+  white-space: nowrap; background: linear-gradient(180deg, rgba(15,24,30,.88), rgba(15,24,30,.58));
+  border-left: 2px solid #72df9b; box-shadow: 0 4px 14px rgba(0,0,0,.3); }
+.nametag .name { font-size: 14px; font-weight: 800; letter-spacing: .09em; color: #f0f4ec;
+  text-shadow: 0 1px 4px rgba(0,0,0,.98); text-transform: uppercase; }
+.nametag .bar { width: 64px; height: 3px; margin: 4px auto 0; border-radius: 0;
+  background: rgba(0,0,0,.7); box-shadow: 0 0 5px rgba(0,0,0,.8); overflow: hidden; }
+.nametag .bar i { display: block; height: 100%; width: 100%; background: #72df9b;
   transition: width .2s linear, background .2s linear; }
-.nametag.hurt .bar i { background: #ffcf6b; }
-.nametag.critical .bar i { background: #ff6a55; }
-.nametag.down .name { color: #ff6a55; }
-.nametag .state { font-size: 10px; letter-spacing: .28em; color: #ff6a55; margin-top: 2px;
-  text-shadow: 0 0 8px rgba(0,0,0,.95); }
+.nametag.hurt .bar i { background: #ffc568; }
+.nametag.critical .bar i { background: #ff6b55; }
+.nametag.down .inner { border-left-color: #ff6b55; }
+.nametag.down .name { color: #ff9a83; }
+.nametag .state { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px;
+  font-weight: 800; letter-spacing: .2em; color: #ff6b55; margin-top: 3px; text-shadow: 0 0 8px rgba(0,0,0,.95); }
+
+@media (max-width: 560px) {
+  .nametag .inner { min-width: 70px; padding: 3px 6px 4px; }
+  .nametag .name { font-size: 11px; letter-spacing: .06em; }
+  .nametag .bar { width: 52px; height: 2px; margin-top: 3px; }
+  .nametag .state { font-size: 8px; letter-spacing: .14em; }
+}
 `;
 
 /** Nobody's name is drawn past this. Beyond it the body is a few pixels anyway. */

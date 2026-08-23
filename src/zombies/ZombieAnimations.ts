@@ -1,7 +1,9 @@
 import {
   AnimationClip,
+  AdditiveAnimationBlendMode,
   AnimationMixer,
   AnimationAction,
+  AnimationUtils,
   Euler,
   InterpolateSmooth,
   LoopOnce,
@@ -467,7 +469,11 @@ export function zombieClips(hipsBind: Vector3): Record<string, AnimationClip> {
   let clips = cachedClips.get(key);
   if (!clips) {
     clips = {};
-    for (const spec of SPECS) clips[spec.name] = buildClip(spec, hipsBind);
+    for (const spec of SPECS) {
+      const clip = buildClip(spec, hipsBind);
+      if (spec.name === 'flinch') AnimationUtils.makeClipAdditive(clip, 0);
+      clips[spec.name] = clip;
+    }
     cachedClips.set(key, clips);
   }
   return clips;
@@ -502,6 +508,13 @@ export class ZombieAnimator {
         action.clampWhenFinished = key === 'death';
       } else {
         action.setLoop(LoopRepeat, Infinity);
+      }
+      if (key === 'flinch') {
+        // FLINCH is authored from the same POSTURE baseline as locomotion.
+        // Convert it to deltas so a hit can add a sharp recoil to a walk/run
+        // pose instead of replacing the whole lower body for 340 ms.
+        action.blendMode = AdditiveAnimationBlendMode;
+        action.enabled = false;
       }
       this.actions[key] = action;
     }
@@ -559,9 +572,17 @@ export class ZombieAnimator {
     if (this.locked) return;
     const action = this.actions.flinch;
     action.reset();
+    action.enabled = true;
     action.setEffectiveWeight(Math.min(intensity, 1) * 0.85);
     action.setEffectiveTimeScale(1.4);
     action.play();
+    const handler = (e: { action: AnimationAction }) => {
+      if (e.action !== action) return;
+      this.mixer.removeEventListener('finished', handler as never);
+      action.stop();
+      action.enabled = false;
+    };
+    this.mixer.addEventListener('finished', handler as never);
   }
 
   /** True once the death clip has taken over. */
@@ -572,6 +593,7 @@ export class ZombieAnimator {
   reset() {
     this.locked = false;
     this.mixer.stopAllAction();
+    this.actions.flinch.enabled = false;
     this.actions.idle.reset().play();
     this.current = 'idle';
   }

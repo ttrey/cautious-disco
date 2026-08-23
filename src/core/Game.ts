@@ -334,6 +334,10 @@ export class Game {
     this.zombies.beginRound(this.round, count);
     this.phase = 'active';
     this.hud.setRound(this.round, this.zombies.remaining);
+    // The banner is a status whisper, not a poster: the numeral itself already
+    // lives top-right, so the centre text stays small and brief. (The HUD
+    // clamps dwell and styles the type; here we only stop re-shouting what the
+    // corner shows.)
     this.hud.showBanner(`ROUND ${this.round}`, this.round % 5 === 0 ? 'They are faster now' : 'Survive');
     this.audio.stinger(true);
     this.audio.duckAmbience(0.7, 2.2);
@@ -809,12 +813,6 @@ export class Game {
 
     this.player.applyToCamera(this.engine.camera, dt);
 
-    // Recoil is applied to the camera here so it composes with mouse aim
-    // instead of fighting it.
-    const punch = this.weapons.consumeViewPunch(dt);
-    this.player.pitch = clamp(this.player.pitch + punch.pitch, -Math.PI / 2 + 0.02, Math.PI / 2 - 0.02);
-    this.player.yaw += punch.yaw;
-
     // Teammates first: the horde steers toward where they are *this* frame, and
     // updating them afterwards would aim every zombie at last frame's squad.
     if (this.squad) this.squad.update(dt, this.zombies);
@@ -1059,6 +1057,8 @@ export class Game {
     const remaining = this.authoritative ? this.zombies.remaining : this.netRemaining;
     this.hud.setRound(Math.max(1, this.round), this.phase === 'active' ? remaining : 0);
     this.hud.setSpread(this.weapons.crosshairSpread(this.player.moveIntensity, this.player.crouching));
+    const recoil = this.weapons.crosshairRecoil(this.engine.camera);
+    this.hud.setRecoilOffset(recoil.x, recoil.y);
     // The reticle is redundant while aiming down irons and would obscure them.
     this.hud.setCrosshairVisible(this.weapons.aimBlend < 0.6 && this.phase !== 'dead');
     this.hud.setFps(this.engine.fps);

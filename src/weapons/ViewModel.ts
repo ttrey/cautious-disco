@@ -1,5 +1,6 @@
 import {
   AdditiveBlending,
+  Box3,
   BufferGeometry,
   Color,
   CylinderGeometry,
@@ -7,6 +8,9 @@ import {
   Matrix4,
   Mesh,
   MeshBasicMaterial,
+  NormalBlending,
+  MeshPhysicalMaterial,
+  MeshStandardMaterial,
   Object3D,
   PerspectiveCamera,
   PlaneGeometry,
@@ -20,7 +24,12 @@ import { GunModel } from './GunSmith';
 import { WeaponDef } from './WeaponDefs';
 import { buildArms, HandRig } from './Arms';
 import { solveTwoBoneIK } from '../util/ik';
-import { muzzleFlashTexture, smokeTexture } from '../assets/SpriteTextures';
+import {
+  contactShadowTexture,
+  glowTexture,
+  muzzleFlashTexture,
+  smokeTexture,
+} from '../assets/SpriteTextures';
 import { Presets } from '../assets/Materials';
 import { Rng, TAU, clamp, damp, lerp, smoothstep } from '../util/math';
 import { disposeModel } from '../util/dispose';
@@ -39,6 +48,12 @@ const UPPER_ARM = 0.285;
 const FOREARM = 0.265;
 /** Full-ADS rotational viewmodel recoil relative to hip fire. */
 const ADS_RECOIL_ROTATION_SCALE = 0.45;
+/**
+ * The weapon keeps a visible kick without making the whole viewmodel jump out
+ * of the sight picture. Camera/aim recoil is handled separately by
+ * `WeaponSystem`, so this is deliberately a visual-only scale.
+ */
+const VIEWMODEL_RECOIL_SCALE = 0.55;
 /**
  * Full-ADS backward travel relative to hip fire.
  *
@@ -80,6 +95,61 @@ const SUPPORT_HAND_OUTBOARD = 0.035;
 const PALM_STANDOFF = 0.012;
 
 /**
+ * Hip carry bias, layered on top of each weapon's authored `hipPosition`.
+ *
+ * The def data places the weapon roughly at its firing grip; what it cannot
+ * express (it is one pose for all states) is the *stance*: a carried weapon
+ * parks low and to the right of the eye — CS:GO's presentation — rather than
+ * floating level with the sight line. This bias is applied only while the
+ * weapon is at rest at the hip; it fades out with ADS (where the sight picture
+ * must land dead centre), sprint, inspect and the swap raise.
+ */
+const STANCE_X = 0.028;
+/**
+ * Vertical stance offset. Positive: the carry sits HIGHER than the firing grip
+ * alone would place it, because a grip-height rest buries the whole weapon
+ * below the bottom frame edge — grip, hands and all — exactly when the player
+ * has the most time to look at it. CS:GO-style presentation keeps the weapon
+ * in the lower-right *quadrant*, muzzle tip around 60–65% of frame height, and
+ * that needs the receiver lifted clear of the bezel while staying well below
+ * the sight line.
+ */
+const STANCE_Y = 0.025;
+/** Slight inward cant: top of the receiver tips toward the sight line. */
+const STANCE_ROLL = 0.05;
+/** A touch of yaw convergence so the bore reads as pointed downrange. */
+const STANCE_YAW = 0.026;
+
+/**
+ * Ease-out-back: a smoothstep-shaped rise that overshoots its target by a few
+ * percent just before the end, then settles back onto it.
+ *
+ * Used for the equip raise — an arm catching a weapon at the top of the lift
+ * does not stop dead, it carries through and settles. `s` scales the overshoot
+ * (and the invisible starting wind-up, which happens off-screen).
+ */
+function easeOutBack(t: number, s: number): number {
+  const u = t - 1;
+  return 1 + u * u * ((s + 1) * u + s);
+}
+
+/**
+ * How far the nearest weapon geometry is kept from the camera near plane.
+ *
+ * The viewmodel renders through a very narrow near plane so guns never clip
+ * into walls, but extreme poses — a shotgun lowering into sprint, the bottom of
+ * a swap raise — can still swing the stock across it. When the clearance check
+ * below finds geometry inside this margin it slides the whole rig forward just
+ * far enough to clear, which is exactly how shipped games handle it.
+ */
+const NEAR_CLEAR_MARGIN = 0.006;
+
+/** Per-shot barrel-heat gain by class — sustained fire ramps toward glow. */
+function heatPerShot(defClass: string): number {
+  return defClass === 'lmg' ? 0.085 : defClass === 'shotgun' ? 0.09 : defClass === 'rifle' ? 0.07 : 0.05;
+}
+
+/**
  * Where the shoulders sit relative to the view camera.
  *
  * Forward of a real shoulder line on purpose. The viewmodel's job is to put
@@ -113,28 +183,57 @@ export class ViewModel {
   private def: WeaponDef | null = null;
   private readonly gunPivot = new Group();
   private readonly arms: { left: HandRig; right: HandRig };
+  /**
+   * Soft contact shadow grounding the weapon assembly.
+   *
+   * The viewmodel renders in its own scene against whatever the world happens
+   * to show behind it, so without an anchor the gun can appear to float —
+   * most visibly during ADS, when the hands drop toward screen centre. A dim
+   * radial-gradient card riding just below/behind the receiver reads as the
+   * weapon's ambient occlusion onto the shooter's own chest/arms zone. It is
+   * parented to `gunPivot` so recoil, sway and bob move it in lockstep; only
+   * its opacity breathes (fade while swapping/reloading, when the pose stops
+   * being "shouldered").
+   */
+  private contactShadow: Mesh | null = null;
+  private contactShadowMat: MeshBasicMaterial | null = null;
 
   /** 0 = hip, 1 = fully aimed. */
   adsBlend = 0;
   private adsTarget = 0;
 
-  /** Recoil state. Positional kick is bounded; angular kick remains spring-driven. */
+  /** Recoil state. Positional kick is bounded; angular kicks remain spring-driven. */
   private recoilPos = 0;
   private recoilPosTarget = 0;
   private recoilPitch = 0;
   private recoilPitchVel = 0;
   private recoilYaw = 0;
   private recoilYawVel = 0;
+  /**
+   * Roll about the bore axis, spring-driven like pitch/yaw.
+   *
+   * Real recoil torques the weapon around its barrel — the wrist rolls open a
+   * degree or two and springs shut — which reads as power in a way pure
+   * translation never does. A critically-damped decay (the old behaviour) had
+   * no overshoot, so the torque felt like friction rather than mass.
+   */
   private recoilRoll = 0;
-
-  /** Accumulated view punch handed back to the camera, in radians. */
-  viewPunchPitch = 0;
-  viewPunchYaw = 0;
+  private recoilRollVel = 0;
 
   private swayX = 0;
   private swayY = 0;
+  private swayPitch = 0;
+  private swayYaw = 0;
+  private swayRoll = 0;
   private sprintBlend = 0;
   private swapBlend = 1;
+  private swapTarget = 1;
+  private inspectBlend = 0;
+  private inspectTarget = 0;
+  /**
+   * Seconds spent in (or easing out of) the inspect pose. Drives the slow
+   * appraisal drift so the pose keeps living while held instead of freezing.
+   */
   private inspectTime = 0;
 
   /** Reload timeline, 0..1 while reloading, -1 when idle. */
@@ -145,10 +244,32 @@ export class ViewModel {
 
   private readonly flashGroup = new Group();
   private readonly flashPlanes: Mesh[] = [];
+  /** Per-plane phase offsets so each flash card flickers independently. */
+  private readonly flashSeeds = [0.13, 0.71, 0.37];
   private readonly flashLight: PointLight;
   private flashLife = 0;
-  private readonly smokePuffs: { mesh: Mesh; life: number; vel: Vector3 }[] = [];
+  /**
+   * Barrel heat from sustained fire, 0..1. Ramps per shot, radiates off
+   * between strings; drives the muzzle-area glow cards below.
+   */
+  private barrelHeat = 0;
+  private readonly heatGlow: Mesh;
+  private readonly heatLight: PointLight;
+  private readonly smokePuffs: { mesh: Mesh; life: number; vel: Vector3; swirlPhase: number; spinRate: number }[] = [];
   private readonly smokeGeo = new PlaneGeometry(1, 1);
+
+  /** Fake ambient occlusion blobs where each hand presses onto the weapon. */
+  private readonly contactBlobs: Mesh[] = [];
+  private readonly contactGeo = new PlaneGeometry(1, 1);
+  private readonly contactMat: MeshBasicMaterial;
+
+  /**
+   * Weapon bounding-box corners in gunPivot space, captured once per equip for
+   * the near-plane clearance check. Eight corner transforms per frame is far
+   * cheaper than a true sweep and bounds every static part of the model.
+   */
+  private gunCorners: Vector3[] | null = null;
+  private cameraNear = 0.008;
 
   private readonly shells: Shell[] = [];
   private readonly shellPool: Shell[] = [];
@@ -162,6 +283,7 @@ export class ViewModel {
   private readonly tmpVec2 = new Vector3();
   private readonly tmpQuat = new Quaternion();
   private readonly gripBasis = new Matrix4();
+  private readonly tmpMat = new Matrix4();
   private readonly axisX = new Vector3();
   private readonly axisY = new Vector3();
   private readonly axisZ = new Vector3();
@@ -198,6 +320,71 @@ export class ViewModel {
     this.flashGroup.add(this.flashLight);
     this.gunPivot.add(this.flashGroup);
 
+    // --- Contact shadow: the card that stops the weapon reading as a cutout ---
+    //
+    // Multiplicative darkening (black with normal blending, low opacity) rather
+    // than additive: this is occlusion, not light. The radial gradient keeps
+    // the edge soft so it never reads as a decal. `depthTest: false` + a low
+    // render order would fight the flash cards, so instead it renders after
+    // everything at its own depth — parked behind/below the receiver where only
+    // torso-zone pixels sit, it just quietly darkens whatever is there.
+    const contactMat = new MeshBasicMaterial({
+      map: contactShadowTexture(),
+      transparent: true,
+      depthWrite: false,
+      toneMapped: false,
+      opacity: 0.36,
+    });
+    // The texture's own alpha falloff does the shaping; normal blending keeps
+    // the black RGB darkening whatever sits behind the card.
+    contactMat.blending = NormalBlending;
+    this.contactShadowMat = contactMat;
+    this.contactShadow = new Mesh(new PlaneGeometry(1, 1), contactMat);
+    // Below the bore line and slightly behind the receiver centre: the zone
+    // the shooter's chest occupies from the camera's point of view.
+    this.contactShadow.position.set(0, -0.16, 0.06);
+    this.contactShadow.scale.setScalar(0.42);
+    this.contactShadow.renderOrder = -1;
+    this.contactShadow.visible = false;
+    this.gunPivot.add(this.contactShadow);
+
+    // --- Barrel heat: a soft ember card parked just behind the muzzle ---
+    //
+    // Sustained fire soaks the barrel and it glows — briefly visible between
+    // shots as a dull orange halo that outlives each flash by seconds. The
+    // shared radial glow texture does all the work; only opacity and scale
+    // move with heat.
+    const heatMat = new MeshBasicMaterial({
+      map: glowTexture(),
+      transparent: true,
+      blending: AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+      opacity: 0,
+      color: new Color(0xff6a26),
+    });
+    this.heatGlow = new Mesh(new PlaneGeometry(1, 1), heatMat);
+    this.heatGlow.scale.setScalar(0.09);
+    this.heatGlow.visible = false;
+    this.heatGlow.renderOrder = 2;
+    this.gunPivot.add(this.heatGlow);
+    this.heatLight = new PointLight(0xff5a20, 0, 1.4, 2);
+    this.heatLight.castShadow = false;
+    this.gunPivot.add(this.heatLight);
+
+    // Fake contact shadow where hands press onto the weapon: a dark radial
+    // decal at each grip point. True hand shadows need a second shadow pass
+    // the viewmodel budget cannot afford; a soft blob under the palms sells
+    // the same "hands are holding this" weight for two quads.
+    this.contactMat = new MeshBasicMaterial({
+      map: glowTexture(),
+      transparent: true,
+      depthWrite: false,
+      toneMapped: false,
+      opacity: 0.26,
+      color: new Color(0x000000),
+    });
+
     this.buildShellGeometry();
   }
 
@@ -214,18 +401,215 @@ export class ViewModel {
     }
     this.def = def;
     this.gun = def.build();
+    this.applyWeaponMaterialBreakup(this.gun.root);
     this.gunPivot.add(this.gun.root);
     this.resetReloadParts();
     this.gunPivot.add(this.flashGroup);
     this.flashGroup.position.copy(this.gun.muzzle.position);
+    // Heat card rides just behind the muzzle, hugging the barrel rather than
+    // floating in the air past it.
+    this.heatGlow.position.copy(this.gun.muzzle.position);
+    this.heatGlow.position.z += 0.045;
+    this.heatLight.position.copy(this.heatGlow.position);
+    this.barrelHeat = 0;
+    this.attachContactShadows(def);
+    this.captureNearCorners();
     this.swapBlend = 0;
+    this.swapTarget = 1;
+    this.inspectBlend = 0;
+    this.inspectTarget = 0;
+    this.adsBlend = 0;
+    this.adsTarget = 0;
     this.reloadT = -1;
+    this.reloadEmpty = false;
+    this.shellReloadStage = 0;
     this.recoilPos = 0;
     this.recoilPosTarget = 0;
+    this.recoilPitch = 0;
+    this.recoilPitchVel = 0;
+    this.recoilYaw = 0;
+    this.recoilYawVel = 0;
+    this.recoilRoll = 0;
+    this.recoilRollVel = 0;
+  }
+
+  /**
+   * Dark decal under each hand's palm, in weapon space at the grip point.
+   *
+   * Rebuilt per equip because the grip points are per weapon. The blobs are
+   * nudged a few millimetres outboard of the grip so they sit between the
+   * receiver flank and the palm standoff — close enough to read as contact,
+   * far enough to never z-fight the weapon's own surfaces.
+   */
+  private attachContactShadows(def: WeaponDef) {
+    for (const blob of this.contactBlobs) {
+      this.gunPivot.remove(blob);
+    }
+    this.contactBlobs.length = 0;
+    // Blobs sit where the *palms* hover, using the same standoffs the IK
+    // targets use (PALM_STANDOFF / SUPPORT_HAND_OUTBOARD) plus a hair — that
+    // gap is guaranteed clear of geometry, whereas the grip points themselves
+    // can be buried inside a thick fore-end. Radial falloff means the quad
+    // vanishes edge-on, so the extra height never reads as a card.
+    const grips: [readonly number[], number][] = [
+      [def.rightGrip, 1],
+      [def.leftGrip, -1],
+    ];
+    for (const [grip, outboard] of grips) {
+      const blob = new Mesh(this.contactGeo, this.contactMat);
+      const lift = outboard > 0 ? PALM_STANDOFF + 0.003 : SUPPORT_HAND_OUTBOARD + 0.004;
+      blob.position.set(grip[0] + outboard * lift, grip[1] - (outboard < 0 ? PALM_REACH : 0), grip[2]);
+      // The plane's +Z normal is swung to face outboard, and its local X —
+      // which becomes the weapon's length axis after the swing — is scaled
+      // longer than its height so the shadow smears along the grip like a
+      // real occlusion patch instead of a round sticker.
+      blob.rotation.y = (outboard * Math.PI) / 2;
+      blob.scale.set(0.085, 0.055, 1);
+      blob.renderOrder = 3;
+      this.gunPivot.add(blob);
+      this.contactBlobs.push(blob);
+    }
+  }
+
+  /**
+   * Records the weapon's bounding box (in gunPivot space) for the per-frame
+   * near-plane clearance check in `composeTransform`.
+   */
+  private captureNearCorners() {
+    this.gunPivot.updateWorldMatrix(true, false);
+    this.tmpMat.copy(this.gunPivot.matrixWorld).invert();
+    const bbox = new Box3().setFromObject(this.gun!.root);
+    this.gunCorners = [];
+    for (const x of [bbox.min.x, bbox.max.x]) {
+      for (const y of [bbox.min.y, bbox.max.y]) {
+        for (const z of [bbox.min.z, bbox.max.z]) {
+          this.gunCorners.push(new Vector3(x, y, z).applyMatrix4(this.tmpMat));
+        }
+      }
+    }
+  }
+
+  /**
+   * Adds a restrained viewmodel-only material grade after the weapon is built.
+   *
+   * GunSmith deliberately batches by material role (`steel`, `bright`, `poly`,
+   * `dark`, and so on). Keeping the pass here means every current and future
+   * weapon gets a consistent first-person finish without changing weapon data,
+   * stats, or the shared world materials. It is intentionally scalar-only:
+   * the baked PBR maps remain authoritative for surface breakup and normals.
+   */
+  private applyWeaponMaterialBreakup(root: Object3D) {
+    const tuned = new Set<MeshStandardMaterial>();
+    // Polished-role clearcoat pass (below) needs every mesh that shares a
+    // material: MeshKit batches by role, so one `bright` instance typically
+    // backs several merged meshes across a build's sub-assemblies.
+    const users = new Map<MeshStandardMaterial, { role: string; meshes: Mesh[] }>();
+    root.traverse((object) => {
+      const mesh = object as Mesh;
+      if (!mesh.isMesh) return;
+
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const source of materials) {
+        const material = source as MeshStandardMaterial;
+        if (!material.isMeshStandardMaterial || material.transparent || tuned.has(material)) continue;
+        tuned.add(material);
+
+        const role = mesh.name.toLowerCase();
+        // The optic pass owns its glass/reticle contrast; leave those materials
+        // untouched so the sight picture never gets hazy from the grade.
+        if (/glass|dot|liner/.test(role)) continue;
+
+        // Stable, very small tonal drift keeps a merged bucket from reading as
+        // a single CG colour while remaining below the threshold of painted
+        // camo or a gameplay-affecting tint.
+        const seed = Array.from(role).reduce((sum, char) => sum + char.charCodeAt(0), 0);
+        const tonalDrift = ((seed % 7) - 3) * 0.008;
+        material.color.offsetHSL(0, 0, tonalDrift);
+
+        if (/bright|scopeRing|sightFrame/.test(role)) {
+          // Machined edges should catch a clean, narrow highlight beside the
+          // matte receiver without turning into chrome. The envMapIntensity
+          // floor doubles as a rim-highlight term: the viewmodel scene carries
+          // an IBL probe with hard bright strips in it, so pushing polished
+          // metal's response to those strips puts a moving specular edge along
+          // receivers and bolts no matter where the key light sits.
+          material.roughness = clamp(material.roughness * 0.8, 0.26, 0.7);
+          material.envMapIntensity = Math.max(material.envMapIntensity, 1.55);
+        } else if (/steel|scopeBody/.test(role)) {
+          // Same rim term, one step down: blued/parkerised steel keeps more of
+          // its roughness but still picks up the strips along bevels and seam
+          // lines — this is what separates "dark metal" from "black plastic".
+          // Roughness comes down harder than a polish: at 0.9 the IBL strips
+          // smear into nothing, while ~0.7 stretches them into the long
+          // anisotropic-looking sheen a blued receiver actually shows.
+          material.roughness = clamp(material.roughness * 0.86, 0.36, 0.84);
+          material.envMapIntensity = Math.max(material.envMapIntensity, 1.48);
+        } else if (/dark|rubber|vent/.test(role)) {
+          // Recesses and rubber absorb the fill, giving the hand and receiver
+          // highlights a readable edge to sit against. Deepened slightly: the
+          // shadow side of the weapon is what gives the lit flank its punch,
+          // and the fill light was flattening it.
+          material.roughness = Math.max(material.roughness, 0.95);
+          material.metalness = Math.min(material.metalness, 0.06);
+          material.envMapIntensity = Math.min(material.envMapIntensity, 0.38);
+        } else if (/poly|panel|stock|grip/.test(role)) {
+          material.roughness = clamp(material.roughness * 1.04, 0.72, 1);
+          material.metalness = Math.min(material.metalness, 0.06);
+          material.envMapIntensity = Math.min(material.envMapIntensity, 0.72);
+        }
+
+        let entry = users.get(material);
+        if (!entry) users.set(material, (entry = { role, meshes: [] }));
+        entry.meshes.push(mesh);
+      }
+    });
+
+    // Slight clearcoat on polished roles.
+    //
+    // MeshStandardMaterial cannot express a coating layer, so polished parts
+    // (`bright` fasteners/bolts, `bsteel`, witness marks) are upgraded to
+    // MeshPhysicalMaterial with a thin coat. The coat is what turns the IBL
+    // strips into a crisp secondary highlight riding OVER the brushed base —
+    // the same trick as the gloved hands' leather sheen in Arms.ts — while the
+    // scalar grade above keeps the base itself honest. Swapping the class is
+    // confined to the viewmodel copy of each build: weapon models are built
+    // per equip and disposed with it, so nothing world-side shares these.
+    for (const [material, { role, meshes }] of users) {
+      if (!/bright|bsteel|witness|polish|chrome|nickel/.test(role)) continue;
+      // Field-by-field copy rather than `physical.copy(standard)`: the
+      // PhysicalMaterial copy routine reads clearcoat-only fields
+      // (`clearcoatNormalScale` &c.) that do not exist on a plain standard
+      // material and throws. These maps are exactly what `makeSurface` sets.
+      const coated = new MeshPhysicalMaterial();
+      coated.color.copy(material.color);
+      coated.roughness = material.roughness;
+      coated.metalness = material.metalness;
+      coated.envMapIntensity = material.envMapIntensity;
+      coated.map = material.map;
+      coated.normalMap = material.normalMap;
+      if (material.normalMap) coated.normalScale.copy(material.normalScale);
+      coated.roughnessMap = material.roughnessMap;
+      coated.metalnessMap = material.metalnessMap;
+      coated.aoMap = material.aoMap;
+      coated.aoMapIntensity = material.aoMapIntensity;
+      coated.emissive.copy(material.emissive);
+      coated.emissiveIntensity = material.emissiveIntensity;
+      coated.clearcoat = 0.24;
+      coated.clearcoatRoughness = 0.32;
+      for (const mesh of meshes) mesh.material = coated;
+      material.dispose();
+    }
   }
 
   setAiming(aiming: boolean) {
     this.adsTarget = aiming ? 1 : 0;
+  }
+
+  /** Starts the lower half of a weapon swap before the new weapon is built. */
+  startLower() {
+    this.swapTarget = 0;
+    this.inspectTarget = 0;
+    this.cancelReload();
   }
 
   /** True when the weapon in hand carries an optic with a sight picture. */
@@ -252,19 +636,23 @@ export class ViewModel {
 
   startReload(duration: number, empty: boolean) {
     this.reloadT = 0;
-    this.reloadDuration = duration;
+    this.reloadDuration = Math.max(duration, 0.05);
     this.reloadEmpty = empty;
+    this.inspectTarget = 0;
   }
 
   startShellInsert(duration: number) {
     this.reloadT = 0;
-    this.reloadDuration = duration;
+    this.reloadDuration = Math.max(duration, 0.05);
     this.reloadEmpty = false;
     this.shellReloadStage = (this.shellReloadStage + 1) % 2;
+    this.inspectTarget = 0;
   }
 
   cancelReload() {
     this.reloadT = -1;
+    this.reloadEmpty = false;
+    this.shellReloadStage = 0;
     this.resetReloadParts();
   }
 
@@ -281,31 +669,38 @@ export class ViewModel {
       this.gun.magazine.visible = true;
     }
     if (this.gun.charging) this.gun.charging.position.z = 0;
+    if (this.gun.slide && this.gun.slide !== this.gun.charging) this.gun.slide.position.z = 0;
     if (this.gun.feedCover) this.gun.feedCover.rotation.set(0, 0, 0);
   }
 
-  /** Kicks the whole weapon and returns the view punch for the camera. */
+  /** Kicks the viewmodel without changing the player's world camera. */
   fire(def: WeaponDef, shotIndex: number) {
     const r = def.recoil;
     const translationScale = lerp(1, ADS_RECOIL_TRANSLATION_SCALE, this.adsBlend);
     const rotationScale = lerp(1, ADS_RECOIL_ROTATION_SCALE, this.adsBlend);
     this.recoilPosTarget = clamp(
-      this.recoilPosTarget + r.kick * translationScale,
+      this.recoilPosTarget + r.kick * translationScale * VIEWMODEL_RECOIL_SCALE,
       0,
       this.maxRecoilTranslation(r.kick, translationScale),
     );
-    this.recoilPitchVel += (r.vertical * Math.PI) / 180 * 34 * rotationScale;
+    this.recoilPitchVel += (r.vertical * Math.PI) / 180 * 34 * rotationScale * VIEWMODEL_RECOIL_SCALE;
 
     // Alternating horizontal wander with a per-weapon directional bias makes
     // the pattern learnable instead of random.
     const wander = Math.sin(shotIndex * 2.399) * 0.6 + this.rng.range(-0.4, 0.4);
-    this.recoilYawVel += ((r.horizontal * (wander + r.drift)) * Math.PI) / 180 * 30 * rotationScale;
-    this.recoilRoll += (this.rng.range(-0.02, 0.02) - r.drift * 0.012) * rotationScale;
+    this.recoilYawVel += ((r.horizontal * (wander + r.drift)) * Math.PI) / 180 * 30 * rotationScale * VIEWMODEL_RECOIL_SCALE;
+    // Barrel torque: an impulse into a roll *spring*, not a direct offset.
+    // The wrist rolls open about the bore and springs back with a touch of
+    // overshoot, which is where the shot's "power" is felt. Drift biases the
+    // torque consistently to one side so automatic fire visibly screws in,
+    // while the random component keeps single shots from looking scripted.
+    this.recoilRollVel += ((this.rng.range(-1, 1) * 0.17) - r.drift * 0.085) * rotationScale * VIEWMODEL_RECOIL_SCALE;
 
-    // View punch is damped hard when aiming — a shouldered weapon moves less.
-    const adsDamp = lerp(1, 0.55, this.adsBlend);
-    this.viewPunchPitch += ((r.vertical * Math.PI) / 180) * adsDamp;
-    this.viewPunchYaw += (((r.horizontal * wander) * Math.PI) / 180) * adsDamp;
+    // Sustained fire soaks the barrel toward glow. Wonder weapons have no
+    // conventional barrel to heat — their muzzle cards already carry colour.
+    if (!def.wonder) {
+      this.barrelHeat = Math.min(1, this.barrelHeat + heatPerShot(def.class));
+    }
 
     this.spawnFlash(def);
   }
@@ -321,7 +716,10 @@ export class ViewModel {
         : 0xffd9a0;
     for (const p of this.flashPlanes) {
       p.visible = true;
-      p.scale.setScalar(scale * this.rng.range(0.82, 1.22));
+      // Wide per-shot variance in size and roll: powder gas burns unevenly
+      // every time, and three independently rolled, independently scaled
+      // cards read as volume rather than as a spinning decal.
+      p.scale.setScalar(scale * this.rng.range(0.72, 1.34));
       p.rotation.z = this.rng.next() * TAU;
       const mat = p.material as MeshBasicMaterial;
       mat.color.setHex(energyColor);
@@ -343,18 +741,23 @@ export class ViewModel {
       transparent: true,
       depthWrite: false,
       depthTest: false,
-      opacity: 0.34,
+      opacity: 0,
       color: new Color(0x9a938a),
       toneMapped: true,
     });
     const mesh = new Mesh(this.smokeGeo, mat);
     mesh.position.copy(this.gun.muzzle.position);
-    mesh.scale.setScalar(0.06);
+    mesh.scale.setScalar(0.05);
     this.gunPivot.add(mesh);
+    // Each wisp gets its own curl phase and roll rate, so a string of shots
+    // leaves several independently wandering columns of smoke rather than one
+    // cloned puff marching in lockstep.
     this.smokePuffs.push({
       mesh,
       life: 1,
-      vel: new Vector3(this.rng.range(-0.06, 0.06), this.rng.range(0.08, 0.2), -this.rng.range(0.2, 0.5)),
+      vel: new Vector3(this.rng.range(-0.05, 0.05), this.rng.range(0.06, 0.16), -this.rng.range(0.25, 0.55)),
+      swirlPhase: this.rng.next() * TAU,
+      spinRate: this.rng.range(-0.9, 0.9),
     });
   }
 
@@ -399,13 +802,38 @@ export class ViewModel {
   ) {
     if (!this.gun || !this.def) return;
     const def = this.def;
+    this.cameraNear = camera.near;
 
     // --- Blends -----------------------------------------------------------
-    const canAds = !this.reloading && !ctx.sprinting;
+    const canRaise = this.swapTarget > 0.5;
+    const canAds = canRaise && !this.reloading && !ctx.sprinting && !ctx.inspecting;
     this.adsBlend = damp(this.adsBlend, canAds ? this.adsTarget : 0, 1 / Math.max(def.adsTime, 0.01) * 0.9, dt);
-    this.sprintBlend = damp(this.sprintBlend, ctx.sprinting && !this.reloading ? 1 : 0, 9, dt);
-    this.swapBlend = damp(this.swapBlend, 1, 1 / Math.max(def.swapTime, 0.05) * 1.4, dt);
-    this.inspectTime = ctx.inspecting ? Math.min(this.inspectTime + dt, 2.2) : Math.max(this.inspectTime - dt * 2.5, 0);
+    const sprintTarget = ctx.sprinting && !this.reloading ? 1 : 0;
+    // Asymmetric ease: settling INTO the carry is heavy (slow attack — the
+    // arms lower the weapon), snapping back to ready is urgent (fast release).
+    // One rate for both directions made the lower feel weightless on the way
+    // down and sluggish on the way up.
+    this.sprintBlend = damp(this.sprintBlend, sprintTarget, sprintTarget > this.sprintBlend ? 6.5 : 12, dt);
+    this.swapBlend = damp(this.swapBlend, this.swapTarget, 1 / Math.max(def.swapTime, 0.05) * 1.4, dt);
+    this.inspectTarget = ctx.inspecting && canRaise && !this.reloading && !ctx.sprinting ? 1 : 0;
+    this.inspectBlend = damp(this.inspectBlend, this.inspectTarget, 8, dt);
+    // The appraisal clock runs while the pose is alive at all (including its
+    // ease-out) so the drift below never snaps phase when the key releases.
+    if (this.inspectBlend > 0.001) this.inspectTime += dt;
+
+    // --- Contact shadow ---------------------------------------------------
+    //
+    // The card is only meaningful while the weapon is shouldered in a stable
+    // pose. ADS lifts the muzzle toward screen centre where the card would
+    // smear across the sight picture, so its weight fades out with the aim
+    // blend; swaps and reloads drop the pose entirely. Damped like every other
+    // blend so the shadow eases rather than pops.
+    if (this.contactShadow && this.contactShadowMat) {
+      const grounded = (1 - this.adsBlend) * this.swapBlend * (this.reloading ? 0.35 : 1);
+      const targetOpacity = 0.36 * grounded * (1 - this.sprintBlend * 0.55);
+      this.contactShadowMat.opacity = damp(this.contactShadowMat.opacity, targetOpacity, 10, dt);
+      this.contactShadow.visible = this.contactShadowMat.opacity > 0.01;
+    }
 
     // --- Springs ----------------------------------------------------------
     const rec = def.recoil;
@@ -423,16 +851,17 @@ export class ViewModel {
     );
     this.recoilPitch = this.springStep(this.recoilPitch, () => this.recoilPitchVel, (v) => (this.recoilPitchVel = v), rec.recovery * 4.6, rec.recovery, dt);
     this.recoilYaw = this.springStep(this.recoilYaw, () => this.recoilYawVel, (v) => (this.recoilYawVel = v), rec.recovery * 3.6, rec.recovery * 0.85, dt);
-    this.recoilRoll = damp(this.recoilRoll, 0, rec.recovery * 0.9, dt);
-
-    // View punch decays back to centre; the camera consumes it each frame.
-    this.viewPunchPitch = damp(this.viewPunchPitch, 0, rec.recovery * 0.55, dt);
-    this.viewPunchYaw = damp(this.viewPunchYaw, 0, rec.recovery * 0.5, dt);
+    // Slightly softer than yaw: roll is the last motion to settle, which is
+    // what makes the weapon feel like it rocks on its bore axis.
+    this.recoilRoll = this.springStep(this.recoilRoll, () => this.recoilRollVel, (v) => (this.recoilRollVel = v), rec.recovery * 3.2, rec.recovery * 0.72, dt);
 
     // --- Sway: the gun lags the camera, more so at the hip ----------------
     const swayScale = lerp(1, 0.26, this.adsBlend);
     this.swayX = damp(this.swayX, clamp(-ctx.lookX * 3.4, -0.09, 0.09) * swayScale, 11, dt);
     this.swayY = damp(this.swayY, clamp(-ctx.lookY * 3.0, -0.07, 0.07) * swayScale, 11, dt);
+    this.swayPitch = damp(this.swayPitch, clamp(ctx.lookY * 0.9, -0.06, 0.06) * swayScale, 10, dt);
+    this.swayYaw = damp(this.swayYaw, clamp(-ctx.lookX * 1.05, -0.075, 0.075) * swayScale, 10, dt);
+    this.swayRoll = damp(this.swayRoll, clamp(-ctx.lookX * 0.42, -0.035, 0.035) * swayScale, 10, dt);
 
     this.composeTransform(dt, def, ctx);
     this.updateFlash(dt);
@@ -449,7 +878,7 @@ export class ViewModel {
   }
 
   private maxRecoilTranslation(kick: number, translationScale: number) {
-    return Math.min(MAX_VIEWMODEL_RECOIL_TRANSLATION, kick * 2 * translationScale);
+    return Math.min(MAX_VIEWMODEL_RECOIL_TRANSLATION, kick * 2 * translationScale * VIEWMODEL_RECOIL_SCALE);
   }
 
   /**
@@ -511,10 +940,19 @@ export class ViewModel {
     let py = lerp(hip[1], adsY, this.adsBlend);
     let pz = lerp(hip[2], adsZ, this.adsBlend);
 
-    // Idle breathing — slow, elliptical, and suppressed while aiming.
-    const breathe = (1 - this.adsBlend * 0.72) * (1 - ctx.bobAmount * 0.6);
-    px += Math.sin(t * 0.75) * 0.0032 * breathe;
-    py += Math.sin(t * 1.13 + 0.9) * 0.0038 * breathe;
+    // Idle breathing — slow, elliptical, suppressed while aiming or presenting
+    // an inspection pose.
+    //
+    // The amplitude itself wanders on an eight-second cycle with a faster
+    // incommensurate detail wave on top. A fixed-amplitude sine is the single
+    // loudest "procedural viewmodel" tell there is — real breathing comes in
+    // shallower and deeper swells, and a player who never fires still watches
+    // the weapon breathe for minutes.
+    const inspectWeight = smoothstep(this.inspectBlend);
+    const breathe = (1 - this.adsBlend * 0.72) * (1 - inspectWeight * 0.55) * (1 - ctx.bobAmount * 0.6);
+    const breathAmp = breathe * (0.72 + Math.sin(t * TAU / 8 + 1.3) * 0.24 + Math.sin(t * TAU / 8 * 2.71 + 4.2) * 0.1);
+    px += Math.sin(t * 0.75) * 0.0032 * breathAmp;
+    py += Math.sin(t * 1.13 + 0.9) * 0.0038 * breathAmp;
 
     // Walk bob, figure-of-eight, scaled down when aiming.
     const bobScale = ctx.bobAmount * lerp(1, 0.22, this.adsBlend);
@@ -529,9 +967,16 @@ export class ViewModel {
     pz += this.recoilPos;
     py += this.recoilPos * 0.28;
 
-    // Swap: the weapon rises into frame from below with a slight roll.
+    // Swap: the weapon rises into frame from below with a slight roll, then
+    // settles with a bounce. The rise itself is an ease-out-back: it carries
+    // ~4% of its travel past rest before settling onto it — an arm catching
+    // weight, not a winch. (Its starting wind-up dips deeper off-screen, which
+    // costs nothing.) Translation depth and roll stay on plain smoothstep so
+    // only the vertical read bounces.
     const swapEase = smoothstep(clamp(this.swapBlend, 0, 1));
-    py -= (1 - swapEase) * 0.34;
+    const backEase = easeOutBack(clamp(this.swapBlend, 0, 1), 1.1);
+    const settleCatch = Math.max(0, backEase - swapEase);
+    py -= (1 - backEase) * 0.34;
     pz += (1 - swapEase) * 0.1;
 
     // Sprint: canted low and away, muzzle down-left. Reads as "not ready".
@@ -540,43 +985,103 @@ export class ViewModel {
     py -= sp * 0.052;
     pz += sp * 0.03;
 
-    // Inspect: rotate the weapon into view.
-    const insp = smoothstep(clamp(this.inspectTime / 0.45, 0, 1)) * (this.inspectTime > 0 ? 1 : 0);
-
-    this.gunPivot.position.set(px, py, pz);
+    // Stance bias: low-right carry, applied only while actually resting at the
+    // hip. Every other state (ADS, sprint, inspect, reload tip, mid-swap)
+    // owns the pose then, so this fades out under all of them.
+    const stanceWeight =
+      (1 - smoothstep(clamp(this.adsBlend, 0, 1))) *
+      (1 - sp) *
+      swapEase *
+      (1 - inspectWeight * 0.85);
+    px += stanceWeight * STANCE_X;
+    py += stanceWeight * STANCE_Y;
 
     // The bore points along -Z, so positive X rotation raises the muzzle.
     let rx = lerp(def.hipRotation[0], 0, this.adsBlend) + this.recoilPitch;
     let ry = lerp(def.hipRotation[1], 0, this.adsBlend) + this.recoilYaw;
     let rz = lerp(def.hipRotation[2], 0, this.adsBlend) + this.recoilRoll;
 
-    rx += Math.sin(t * 1.13 + 0.9) * 0.012 * breathe;
-    ry += Math.sin(t * 0.75) * 0.014 * breathe;
+    rx += Math.sin(t * 1.13 + 0.9) * 0.012 * breathAmp;
+    ry += Math.sin(t * 0.75) * 0.014 * breathAmp;
     rx += Math.sin(ctx.bobPhase * 2 + 1.1) * 0.02 * bobScale;
     rz += Math.cos(ctx.bobPhase) * 0.03 * bobScale;
+    // The hands lag the camera by a few degrees as well as a few centimetres.
+    // These targets are bounded by the current look delta and always decay to
+    // zero, so a held automatic trigger can never turn sway into drift.
+    rx += this.swayPitch;
+    ry += this.swayYaw;
+    rz += this.swayRoll;
     rz -= (1 - swapEase) * 0.5;
+    // Settle-bounce pitch/roll catch (see the translation ease above): the
+    // muzzle dips as the weight lands, rolling a touch with it.
+    rx -= settleCatch * 0.5;
+    rz += settleCatch * 0.35;
     // Sprint cant.
     rx += sp * 0.16;
     ry -= sp * 0.42;
     rz += sp * 0.5;
-    // Inspect rotation.
-    ry += insp * 0.9;
-    rz += insp * 0.5;
-    rx += insp * 0.15;
+    // Stance cant — the inward tip that makes the carry read as "held", not
+    // "glued level".
+    rz += stanceWeight * STANCE_ROLL;
+    ry += stanceWeight * STANCE_YAW;
+    // Inspect is a deliberate presentation pose, not an additive spin. It
+    // takes priority over ADS and unwinds cleanly when the key is released.
+    const insp = inspectWeight;
+    px += insp * 0.065;
+    py += insp * 0.018;
+    pz += insp * 0.015;
+    ry += insp * 0.82;
+    rz += insp * 0.46;
+    rx += insp * 0.12;
+    // Appraisal drift: once fully raised, the pose keeps living — slow sweeps
+    // as if the eye is travelling the weapon, plus a faint float. Quadratic
+    // weight keeps it out of the way during the ease-in and ease-out.
+    const admire = insp * insp;
+    ry += Math.sin(this.inspectTime * 1.7) * 0.085 * admire;
+    rz += Math.sin(this.inspectTime * 1.7 + 0.9) * 0.05 * admire;
+    rx += Math.sin(this.inspectTime * 2.4 + 2.1) * 0.03 * admire;
+    py += Math.sin(this.inspectTime * 2.1 + 0.5) * 0.004 * admire;
 
     // Reload pose is applied on top.
     const reloadPose = this.reloadPose(def);
-    this.gunPivot.position.x += reloadPose.x;
-    this.gunPivot.position.y += reloadPose.y;
-    this.gunPivot.position.z += reloadPose.z;
+    px += reloadPose.x;
+    py += reloadPose.y;
+    pz += reloadPose.z;
     rx += reloadPose.pitch;
     ry += reloadPose.yaw;
     rz += reloadPose.roll;
 
+    // Commit translation after every layer has contributed. This is
+    // intentionally late: inspect and reload are pose layers, not metadata
+    // that should be silently ignored by an earlier transform write.
+    this.gunPivot.position.set(px, py, pz);
+
     this.gunPivot.rotation.set(rx, ry, rz);
+
+    // Near-plane clearance: slide the whole rig forward if any bounding corner
+    // of the weapon has swung inside the safety margin (extreme sprint/swap/
+    // reload poses can). The correction is computed fresh each frame from the
+    // composed pose, so it releases smoothly as the pose returns to rest —
+    // and it never engages in normal ADS, where the stock sits well clear.
+    this.gunPivot.updateWorldMatrix(true, false);
+    if (this.gunCorners) {
+      const limit = -(this.cameraNear + NEAR_CLEAR_MARGIN);
+      const m = this.gunPivot.matrixWorld.elements;
+      let closest = -Infinity;
+      for (const c of this.gunCorners) {
+        const z = m[2] * c.x + m[6] * c.y + m[10] * c.z + m[14];
+        if (z > closest) closest = z;
+      }
+      if (closest > limit) {
+        this.gunPivot.position.z -= closest - limit;
+        this.gunPivot.updateWorldMatrix(true, false);
+      }
+    }
 
     // Keep the flash anchored to the (possibly animated) muzzle.
     this.flashGroup.position.copy(this.gun!.muzzle.position);
+    this.heatGlow.position.copy(this.gun!.muzzle.position);
+    this.heatGlow.position.z += 0.045;
     void dt;
   }
 
@@ -660,24 +1165,38 @@ export class ViewModel {
     out.x = 0.028 * tip;
 
     // Magazine animation.
+    //
+    // Deliberately late relative to the support hand: the hand is already
+    // travelling to the pouch while the thumb is still slapping the release,
+    // so the magazine only starts falling once the grip has visibly opened
+    // (see solveArms — the hand departs from p=0). Dropping both together read
+    // as one mechanical event; staggering them reads as a person doing two
+    // things in order.
     const mag = this.gun.magazine;
     if (mag) {
-      if (p < 0.34) {
-        // Drop free.
-        const d = smoothstep(clamp(p / 0.34, 0, 1));
+      if (p < 0.40) {
+        // Drop free, after the release slap has landed.
+        const d = smoothstep(clamp((p - 0.10) / 0.30, 0, 1));
         mag.position.y = -d * 0.4;
         mag.rotation.z = d * 0.5;
         (mag as Object3D).visible = d < 0.95;
-      } else if (p < 0.62) {
+      } else if (p < 0.58) {
         (mag as Object3D).visible = false;
       } else {
         // Insert.
-        const d = smoothstep(clamp((p - 0.62) / 0.24, 0, 1));
+        const d = smoothstep(clamp((p - 0.58) / 0.26, 0, 1));
         (mag as Object3D).visible = true;
         mag.position.y = -(1 - d) * 0.3;
         mag.rotation.z = (1 - d) * 0.28;
       }
     }
+
+    // Grip re-seat: a tiny final press as the firing hand re-tightens after
+    // the bolt release. One short sine on the tail of the timeline — barely
+    // visible, but it stops the weapon from gliding to rest like it's on rails.
+    const reseat = Math.sin(clamp((p - 0.88) / 0.12, 0, 1) * Math.PI);
+    out.pitch += reseat * 0.032;
+    out.y -= reseat * 0.004;
 
     // Charging handle / slide release on the tail of the animation.
     const charge = this.gun.charging ?? this.gun.slide;
@@ -695,6 +1214,8 @@ export class ViewModel {
     this.reloadT += dt / this.reloadDuration;
     if (this.reloadT >= 1) {
       this.reloadT = -1;
+      this.reloadEmpty = false;
+      this.shellReloadStage = 0;
       this.resetReloadParts();
     }
     void def;
@@ -718,33 +1239,68 @@ export class ViewModel {
   }
 
   private updateFlash(dt: number) {
-    if (this.flashLife <= 0) return;
-    // Very short: a muzzle flash that lingers reads as a cartoon.
-    this.flashLife -= dt * 22;
-    const k = clamp(this.flashLife, 0, 1);
-    this.flashLight.intensity *= Math.pow(0.0001, dt);
-    for (const p of this.flashPlanes) {
-      const m = p.material as MeshBasicMaterial;
-      m.opacity = k * k;
-      p.visible = k > 0.02;
-      p.scale.multiplyScalar(1 + dt * 5);
+    const now = performance.now() * 0.001;
+    if (this.flashLife > 0) {
+      // Very short: a muzzle flash that lingers reads as a cartoon.
+      this.flashLife -= dt * 22;
+      const k = clamp(this.flashLife, 0, 1);
+      this.flashLight.intensity *= Math.pow(0.0001, dt);
+      for (let i = 0; i < this.flashPlanes.length; i++) {
+        const p = this.flashPlanes[i];
+        const m = p.material as MeshBasicMaterial;
+        // Per-card flicker: each plane strobes on its own high-frequency
+        // phase, so the burst crackles like burning gas instead of fading
+        // like a lamp on a dimmer.
+        const flicker = 0.78 + 0.22 * Math.sin(now * 90 + this.flashSeeds[i] * 37.1);
+        m.opacity = k * k * flicker;
+        p.visible = k > 0.02;
+        // Decelerating expansion — violent in the first centimetre, holding
+        // shape by the end of its life.
+        p.scale.multiplyScalar(1 + dt * 6 * k);
+      }
+      if (this.flashLife <= 0) {
+        this.flashLight.intensity = 0;
+        for (const p of this.flashPlanes) p.visible = false;
+      }
     }
-    if (this.flashLife <= 0) {
-      this.flashLight.intensity = 0;
-      for (const p of this.flashPlanes) p.visible = false;
+
+    // Barrel heat: glows while hot, radiates away between strings. The slow
+    // exponential tail is what makes it readable at all — a fast decay would
+    // be swallowed by the flash that preceded it.
+    if (this.barrelHeat > 0) {
+      this.barrelHeat = Math.max(0, this.barrelHeat - dt * (this.barrelHeat * 0.32 + 0.02));
+      const heat = this.barrelHeat;
+      const shimmer = 0.9 + 0.1 * Math.sin(now * 11.3);
+      this.heatGlow.visible = heat > 0.015;
+      (this.heatGlow.material as MeshBasicMaterial).opacity = Math.pow(heat, 1.7) * 0.5 * shimmer;
+      this.heatGlow.scale.setScalar(0.075 + heat * 0.06);
+      this.heatLight.intensity = heat * heat * 2.4 * shimmer;
+    } else if (this.heatGlow.visible) {
+      this.heatGlow.visible = false;
+      this.heatLight.intensity = 0;
     }
   }
 
   private updateSmoke(dt: number) {
+    const now = performance.now() * 0.001;
     for (let i = this.smokePuffs.length - 1; i >= 0; i--) {
       const s = this.smokePuffs[i];
-      s.life -= dt * 0.85;
+      s.life -= dt * 0.8;
+      const age = 1 - s.life;
+      s.vel.multiplyScalar(1 - dt * 1.7);
+      s.vel.y += dt * 0.16;
+      // Curl: each wisp wanders laterally on its own phase, so several puffs
+      // separate into distinct drifting columns instead of one blob.
+      s.vel.x += Math.sin(now * 2.6 + s.swirlPhase) * dt * 0.11;
       s.mesh.position.addScaledVector(s.vel, dt);
-      s.vel.multiplyScalar(1 - dt * 1.6);
-      s.vel.y += dt * 0.14;
-      s.mesh.scale.setScalar(0.06 + (1 - s.life) * 0.34);
+      s.mesh.rotation.z += s.spinRate * dt;
+      // Sub-linear growth — smoke billows hard off the muzzle then slows.
+      s.mesh.scale.setScalar(0.05 + Math.pow(clamp(age, 0, 1), 0.75) * 0.33);
       const m = s.mesh.material as MeshBasicMaterial;
-      m.opacity = clamp(s.life, 0, 1) * 0.3;
+      // Fade-in over the first sixth of its life so the puff condenses rather
+      // than popping into full opacity in front of the still-visible flash.
+      m.opacity =
+        0.3 * smoothstep(clamp(age * 6, 0, 1)) * clamp(s.life * 1.7, 0, 1);
       // Billboard toward the view camera (which sits at the origin looking -Z).
       s.mesh.quaternion.identity();
       if (s.life <= 0) {
@@ -779,6 +1335,26 @@ export class ViewModel {
 
     this.gunPivot.updateWorldMatrix(true, true);
 
+    // How far the support hand has left its grip (0 = planted, 1 = away).
+    // Computed before either arm is solved because the thumb-forward grip
+    // blend needs it for both hands.
+    let handAway = 0;
+    if (this.reloadT >= 0 && !def.shellReload) {
+      const p = this.reloadT;
+      // Travel down to the mag pouch and back — an arc, not a straight line.
+      // The departure starts immediately (p≈0), BEFORE the magazine is
+      // released in reloadPose: anticipation is the hand leaving first.
+      handAway = Math.sin(clamp((p - 0.02) / 0.60, 0, 1) * Math.PI);
+    } else if (this.reloadT >= 0 && def.shellReload) {
+      handAway = Math.sin(clamp(this.reloadT, 0, 1) * Math.PI);
+    }
+    // Thumb-forward grip on long guns: thumbs lay along the frame/handguard
+    // instead of wrapping them — the firing thumb rides the receiver, the
+    // support thumb rides the handguard (the C-clamp every modern manual
+    // teaches). Both relax back to a wrapped pose while the support hand is
+    // away fetching a magazine. Pistols keep both thumbs wrapped high.
+    const thumbForward = (def.class === 'pistol' ? 0 : 1) * (1 - clamp(handAway, 0, 1));
+
     // Right hand: always on the fire control grip.
     //
     // The IK drives the *wrist joint*, which sits at the heel of the palm — but
@@ -790,7 +1366,7 @@ export class ViewModel {
     // Pole hint: elbow hangs down and out to the right.
     this.tmpVec2.set(0.55, -0.9, 0.5).add(this.tmpVec);
     solveTwoBoneIK(this.arms.right.root, this.arms.right.elbow, this.tmpVec, this.tmpVec2, UPPER_ARM, FOREARM);
-    this.poseWrist(this.arms.right, 1);
+    this.poseWrist(this.arms.right, 1, thumbForward);
 
     // Left hand: on the handguard, except mid-reload when it fetches a mag.
     // Its wrist sits below the support point; the palm rises onto the barrel
@@ -799,25 +1375,21 @@ export class ViewModel {
     this.tmpVec.set(def.leftGrip[0] - SUPPORT_HAND_OUTBOARD, def.leftGrip[1] - PALM_REACH * 1.5, def.leftGrip[2]);
     this.gunPivot.localToWorld(this.tmpVec);
     if (this.reloadT >= 0 && !def.shellReload) {
-      const p = this.reloadT;
-      // Travel down to the mag pouch and back — an arc, not a straight line.
-      const away = Math.sin(clamp((p - 0.05) / 0.55, 0, 1) * Math.PI);
-      this.tmpVec.x += away * 0.22;
-      this.tmpVec.y -= away * 0.34;
-      this.tmpVec.z += away * 0.16;
+      this.tmpVec.x += handAway * 0.22;
+      this.tmpVec.y -= handAway * 0.34;
+      this.tmpVec.z += handAway * 0.16;
     } else if (this.reloadT >= 0 && def.shellReload) {
-      const away = Math.sin(clamp(this.reloadT, 0, 1) * Math.PI);
-      this.tmpVec.x += away * 0.16;
-      this.tmpVec.y -= away * 0.2;
-      this.tmpVec.z += away * 0.22;
+      this.tmpVec.x += handAway * 0.16;
+      this.tmpVec.y -= handAway * 0.2;
+      this.tmpVec.z += handAway * 0.22;
     }
     this.tmpVec2.set(-0.5, -0.85, 0.35).add(this.tmpVec);
     solveTwoBoneIK(this.arms.left.root, this.arms.left.elbow, this.tmpVec, this.tmpVec2, UPPER_ARM, FOREARM);
-    this.poseWrist(this.arms.left, -1);
+    this.poseWrist(this.arms.left, -1, thumbForward);
   }
 
   /** Orients the hand onto the grip and curls the fingers around it. */
-  private poseWrist(arm: HandRig, side: number) {
+  private poseWrist(arm: HandRig, side: number, thumbForward = 0) {
     if (!this.gun) return;
 
     // Build the hand's frame from the weapon's axes rather than by nudging
@@ -871,10 +1443,32 @@ export class ViewModel {
       arm.triggerFinger.rotation.set(-0.42 - pull * 0.28, -0.6, -1.1);
       arm.fingerTips[0].rotation.x = -1.98 - pull * 0.24;
     }
+
+    // Support-hand thumb: wrapped by default (the Arms.ts authored pose),
+    // blended toward laid-forward along the handguard as `thumbForward` rises.
+    //
+    // In the support hand's frame, rotating the thumb's rest pose further
+    // about local Z swings its long axis onto the bore direction — from
+    // "wrapped over the top" to "riding the rail", the C-clamp stance. (The
+    // firing thumb keeps its authored high wrap: against a receiver it already
+    // reads correctly, and the same rotation does not map cleanly onto the
+    // firing hand's mirrored frame.)
+    const thumb = side < 0 ? arm.fingers[4] : null;
+    if (thumb) {
+      thumb.rotation.x = lerp(-0.45, -0.23, thumbForward);
+      thumb.rotation.z = lerp(side * -0.95, side * -0.95 * -1.26, thumbForward);
+    }
   }
 
   dispose() {
     if (this.gun) disposeModel(this.gun.root);
+    // ViewModel-owned effect resources: the contact decals and the heat card
+    // use the shared cached glow texture (never disposed here), but their
+    // materials and geometries belong to this instance.
+    this.contactMat.dispose();
+    this.contactGeo.dispose();
+    (this.heatGlow.material as MeshBasicMaterial).dispose();
+    this.heatGlow.geometry.dispose();
     this.viewScene.remove(this.root);
   }
 }

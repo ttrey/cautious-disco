@@ -15,7 +15,7 @@ import {
 } from 'three';
 import { mergeAll } from '../util/geometry';
 import { makeSurface } from '../assets/Materials';
-import { SurfaceId } from '../assets/TextureForge';
+import { SurfaceId, surface } from '../assets/TextureForge';
 import { Rng, TAU, clamp, lerp, smoothstep } from '../util/math';
 import {
   BodySection,
@@ -404,24 +404,83 @@ const SKIN_ALBEDO = 0.29;
  * Without this, every operator's sclera is their own complexion: the skin
  * material is tinted per operator, the bake darkens it again, and vertex
  * colours multiply both. An eye white has to be an eye white on all four.
+ *
+ * The divisor is *measured*, not assumed. It used to be a hard-coded mean
+ * albedo for the whole bake, and the day the bake was retuned underneath it
+ * every eye on every operator blew past 1.0 in vertex space and rendered as a
+ * pair of glowing lamps — the compensation was dividing by an albedo the
+ * texture no longer had. Sampling the actual pixels once per session keeps the
+ * eyes correct through any future re-bake.
  */
-function against(target: Tint, materialTint: number, albedo = SKIN_ALBEDO): Tint {
+let bakeMeanCache: Tint | null = null;
+
+function skinBakeMean(): Tint {
+  if (bakeMeanCache) return bakeMeanCache;
+  let mean: Tint = [SKIN_ALBEDO, SKIN_ALBEDO, SKIN_ALBEDO];
+  try {
+    if (typeof document !== 'undefined') {
+      // Cast to HTMLCanvasElement once: CanvasImageSource is a union that
+      // includes VideoFrame, which has no width/height, and drawImage's
+      // source-rect arguments need the concrete canvas shape.
+      const src = surface('soldierSkin').map.image as HTMLCanvasElement;
+      const w = src.width || 64;
+      const h = src.height || 64;
+      const c = document.createElement('canvas');
+      c.width = 32;
+      c.height = 32;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      if (ctx) {
+        ctx.drawImage(src, 0, 0, Math.min(w, src.width), Math.min(h, src.height), 0, 0, 32, 32);
+        const px = ctx.getImageData(0, 0, 32, 32).data;
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        const n = 32 * 32;
+        for (let i = 0; i < px.length; i += 4) {
+          r += px[i];
+          g += px[i + 1];
+          b += px[i + 2];
+        }
+        // Canvas pixels are sRGB; the multiplication happens in linear space,
+        // so the mean has to be decoded before it can divide anything.
+        const toLin = (sum: number) => {
+          const s = sum / n / 255;
+          return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+        };
+        mean = [toLin(r), toLin(g), toLin(b)];
+      }
+    }
+  } catch {
+    // Off the main thread or a tainted canvas: fall back to the historical
+    // constant rather than skipping the compensation entirely.
+  }
+  bakeMeanCache = mean;
+  return mean;
+}
+
+/** Hard ceiling on compensated feature tints. Above this, ACES turns skin into light. */
+const TINT_CEILING = 1.12;
+
+function against(target: Tint, materialTint: number): Tint {
+  const mean = skinBakeMean();
   const r = ((materialTint >> 16) & 255) / 255;
   const g = ((materialTint >> 8) & 255) / 255;
   const b = (materialTint & 255) / 255;
   return [
-    target[0] / Math.max(r * albedo, 0.02),
-    target[1] / Math.max(g * albedo, 0.02),
-    target[2] / Math.max(b * albedo, 0.02),
+    clamp(target[0] / Math.max(r * mean[0], 0.02), 0, TINT_CEILING),
+    clamp(target[1] / Math.max(g * mean[1], 0.02), 0, TINT_CEILING),
+    clamp(target[2] / Math.max(b * mean[2], 0.02), 0, TINT_CEILING),
   ];
 }
 
 /**
  * A living sclera is bright but never white: it carries the shadow of the lids
  * and a wash of surface vessels, and painting it at 1.0 turns the eye into a
- * headlight the moment a rim light catches it.
+ * headlight the moment a rim light catches it. This target is deliberately well
+ * under cheek value — at gameplay distance what reads "human eye" is a dark wet
+ * aperture between two lids, not two bright balls.
  */
-const SCLERA_TARGET: Tint = [0.7, 0.68, 0.63];
+const SCLERA_TARGET: Tint = [0.52, 0.5, 0.46];
 const PUPIL: Tint = [0.04, 0.04, 0.045];
 /** Limbal ring — the dark rim around a real iris. Without it the eye is glass. */
 const LIMBUS: Tint = [0.16, 0.15, 0.15];
@@ -483,10 +542,12 @@ function buildFaceShell(spec: FaceSpec): BufferGeometry {
       let t: Tint = WHITE;
 
       // Supraorbital ridge and glabella. Heavier here than on the zombie
-      // because there is a brow *and* the soft tissue over it.
+      // because there is a brow *and* the soft tissue over it. At 2-4 m this
+      // ridge is the strongest individuality cue on the upper face, so it is
+      // carried at full anatomical depth (7-13 mm proud).
       const brow = gaussian(Math.abs(p.x) - 0.026, 0.024) * gaussian(p.y - 0.014, 0.012) * front;
       const glabella = gaussian(p.x, 0.013) * gaussian(p.y - 0.016, 0.013) * front;
-      dz -= (0.005 + 0.005 * spec.brow) * brow + 0.0032 * glabella;
+      dz -= (0.0075 + 0.0055 * spec.brow) * brow + 0.0038 * glabella;
 
       /*
        * Orbits.
@@ -518,7 +579,13 @@ function buildFaceShell(spec: FaceSpec): BufferGeometry {
         // into the head — see the note on `SOCKET_SHADE`.
         socket = Math.max(socket, smoothstep(clamp(1.25 - d, 0, 1)) * front * (0.55 + 0.45 * upper));
       }
-      t = mixTint(t, SOCKET_SHADE, socket * 0.5);
+      t = mixTint(t, SOCKET_SHADE, clamp(socket * 0.72, 0, 0.8));
+      // The shadow the supraorbital ridge throws onto the lid itself. Without
+      // it the lid is as bright as the forehead and the eye reads as a sticker
+      // applied to the face rather than as something recessed behind a brow.
+      const underBrow =
+        gaussian(Math.abs(p.x) - EYE_X, 0.02) * gaussian(p.y - (EYE_Y + 0.014), 0.009) * front;
+      t = mixTint(t, SOCKET_SHADE, clamp(underBrow * 0.45, 0, 0.5));
 
       // Nasal root: the bridge of the nose is set *back* between the eyes, and
       // the depth of that notch is most of what reads as an individual profile.
@@ -526,14 +593,23 @@ function buildFaceShell(spec: FaceSpec): BufferGeometry {
 
       // Zygomatic arch and the cheek mass hung off it. Two terms: a hard
       // prominence on the bone, and a broad soft fullness below and in front of
-      // it. Only the first exists on the zombie.
+      // it. Only the first exists on the zombie. Both are carried stronger than
+      // a neutral face would need, because at 2-4 m the light that models a
+      // cheekbone comes from above and 4 mm of relief is what survives.
       const zygoBone =
         gaussian(Math.abs(p.x) - 0.052, 0.017) * gaussian(p.y + 0.026, 0.016);
-      dz -= (0.0028 + 0.0042 * spec.cheek) * zygoBone * clamp(face + 0.35, 0, 1);
-      dx -= (0.0022 + 0.0034 * spec.cheek) * zygoBone * side;
+      dz -= (0.0036 + 0.005 * spec.cheek) * zygoBone * clamp(face + 0.35, 0, 1);
+      dx -= (0.0028 + 0.0038 * spec.cheek) * zygoBone * side;
       const buccal =
         gaussian(Math.abs(p.x) - 0.042, 0.02) * gaussian(p.y + 0.05, 0.019) * front;
       dz -= 0.0032 * buccal;
+      // The crease the cheekbone throws — a shallow trough running from the
+      // outer eye corner down toward the jaw. It is the line that separates
+      // "face" from "egg" in three-quarter view.
+      dz += 0.0021
+        * gaussian(Math.abs(p.x) - 0.047, 0.009)
+        * gaussian(p.y + 0.038, 0.02)
+        * clamp(face + 0.2, 0, 1);
 
       // Muzzle: maxilla and mandible carry the mouth forward of the cheeks.
       const muzzle = gaussian(p.x, 0.03) * gaussian(p.y - MOUTH_Y - 0.004, 0.024) * front;
@@ -546,10 +622,11 @@ function buildFaceShell(spec: FaceSpec): BufferGeometry {
       dz -= 0.0038 * gaussian(p.x, 0.019) * gaussian(p.y + 0.101, 0.013) * front;
 
       // Mandible. The gonial angle is what makes a jaw square, and it is a
-      // width term, not a depth one.
+      // width term, not a depth one. Carried heavier than neutral because the
+      // silhouette from three-quarter view is decided by this flare.
       const gonial = gaussian(p.y + 0.078, 0.021) * gaussian(Math.abs(p.x) - 0.056, 0.02);
-      dx -= (0.001 + 0.0055 * spec.jaw) * gonial * side;
-      dz -= 0.0016 * gonial * clamp(face, 0, 1);
+      dx -= (0.0015 + 0.0068 * spec.jaw) * gonial * side;
+      dz -= 0.0022 * gonial * clamp(face, 0, 1);
       // Jaw underside. Keeps the throat from meeting the chin in a straight line.
       dy -= 0.0022 * gaussian(p.y + 0.098, 0.016) * gaussian(p.x, 0.03) * clamp(face, 0, 1);
 
@@ -750,21 +827,24 @@ function buildEye(parts: BufferGeometry[], spec: FaceSpec, sx: number, gaze: num
   // A hooded eye carries its margin further down the globe. The aperture these
   // two leave is about 7 mm on a 25 mm globe, which is the ratio a real eye has
   // — open it to 20 mm and the character is permanently startled.
-  const upperMargin = lerp(0.24, 0.06, spec.eyeFold);
-  const lowerMargin = -0.26;
+  const upperMargin = lerp(0.2, 0.03, spec.eyeFold);
+  const lowerMargin = -0.3;
 
   const upper = dome(centre, lidR, yawFrom, yawTo, upperMargin, lidReach, 16, 6);
   if (upper) parts.push(tint(upper, (x, y) => {
-    // Darker into the crease, so the fold reads without extra geometry.
+    // Lid flesh starts just under cheek value — never white — and darkens into
+    // the crease, so the fold reads without extra geometry. A lid that starts
+    // at full cheek value reads as a continuation of the forehead and leaves
+    // the whole orbit reading as one flat plane.
     const k = clamp((y - centre.y - 0.002) / 0.009, 0, 1);
     void x;
-    return mixTint(WHITE, [0.66, 0.6, 0.58], k * 0.45);
+    return mixTint([1.02, 0.97, 0.95], [0.5, 0.45, 0.44], k * 0.55);
   }));
   const lower = dome(centre, lidR, yawFrom, yawTo, -lidReach, lowerMargin, 16, 5);
   if (lower) parts.push(tint(lower, (x, y) => {
     const k = clamp((centre.y - y - 0.004) / 0.008, 0, 1);
     void x;
-    return mixTint(WHITE, [0.78, 0.72, 0.7], k * 0.3);
+    return mixTint([0.94, 0.9, 0.88], [0.58, 0.52, 0.51], k * 0.4);
   }));
 
   // Lid margins: the lash line above and the thicker wet rim below. Two
@@ -864,8 +944,10 @@ function buildNose(parts: BufferGeometry[], spec: FaceSpec) {
     const depth = smoothCurve(v, [
       [0, 0.006],
       [0.5, 0.0082],
-      [0.8, 0.0118],
-      [1, 0.0092],
+      // Tip mass peaks below the nostril line — the ball of the tip is what
+      // carries the profile in side view, so it is the most projected part.
+      [0.8, 0.0128],
+      [1, 0.0104],
     ]);
     return { y, z: EYE_Z - 0.004 - out, halfWidth, depth };
   };
@@ -878,14 +960,26 @@ function buildNose(parts: BufferGeometry[], spec: FaceSpec) {
       // meets itself at the sides in a hard vertical seam down the face, which
       // reads as a ridge glued on rather than as a nose growing out.
       const angle = (u - 0.5) * Math.PI * 1.28;
+      /*
+       * Planes, not a cylinder.
+       *
+       * A circular cross-section turns the dorsum into a round rod glued to the
+       * face — the "cardboard cutout" look. A real nose is a flat bridge plane
+       * with two harder side planes falling off it, and a tip that reads as a
+       * faceted ball. Raising the falloff exponent flattens the top (the
+       * surface holds its projection across the middle third) and steepens the
+       * sides, which is what catches light as a plane edge instead of as a
+       * continuous roll.
+       */
+      const sideFall = Math.pow(1 - Math.cos(angle), 1.42);
       return new Vector3(
         Math.sin(angle) * s.halfWidth,
         s.y,
-        s.z + (1 - Math.cos(angle)) * s.depth,
+        s.z + sideFall * s.depth,
       );
     },
-    22,
-    14,
+    30,
+    16,
     { edgeWidth: 0.003, edgeTint: WHITE },
   );
   if (nose) parts.push(nose);
@@ -898,8 +992,11 @@ function buildNose(parts: BufferGeometry[], spec: FaceSpec) {
   for (const sx of [-1, 1]) {
     parts.push(tint(
       ellipsoid(
-        new Vector3(sx * 0.0068, base.y + 0.0022, base.z + 0.0062),
-        new Vector3(0.0031, 0.0024, 0.0044),
+        // Sunk up into the underside and pulled inboard: proud of the surface
+        // even slightly, they read as two beads stuck under the tip instead of
+        // as the shadowed apertures they are meant to be.
+        new Vector3(sx * 0.0064, base.y + 0.0036, base.z + 0.0046),
+        new Vector3(0.0028, 0.0021, 0.0038),
         10,
         6,
       ),
@@ -1460,6 +1557,29 @@ export function buildSoldierMesh(id: OperatorId): SoldierRig {
       false,
     ));
   }
+  // Trapezius slopes: the ridge every fit neck carries from behind the jaw out
+  // and down to each acromion. Without it a head sits on a cylinder that ends
+  // where the collar begins, which is exactly how the first pass read — the
+  // uniform's mandarin collar was doing all of the blending on its own.
+  for (const sx of [-1, 1]) {
+    const outer = P[`upperArm${sx > 0 ? 'L' : 'R'}` as BoneName];
+    skinParts.push(tint(sweep(
+      [
+        // Rises just under the skull base, behind the sternocleidomastoid.
+        new Vector3(sx * 0.02, neckTop - 0.008, 0.024),
+        new Vector3(sx * lerp(0.05, 0.11, bulk - 0.6), TORSO_SHOULDER_Y + 0.012, 0.012),
+        // Lands on the shoulder line just inboard of the deltoid cap.
+        new Vector3(outer.x * 0.82, outer.y + 0.032, outer.z + 0.004),
+      ],
+      (t) => {
+        const w = lerp(0.014, 0.024, t);
+        return [w, lerp(0.012, 0.02, t)];
+      },
+      10,
+      7,
+      new Vector3(0, 0, 1),
+    ), [1.04, 1.0, 0.97]));
+  }
   // Adam's apple, small: it is a silhouette cue on a raised chin, nothing more.
   skinParts.push(ellipsoid(
     new Vector3(0, lerp(neckBottom, neckTop, 0.6), -0.052),
@@ -1721,6 +1841,35 @@ function buildGlovedHand(
       const rA = r0 * [1, 0.9, 0.8][s];
       const rB = r0 * [0.9, 0.8, 0.66][s];
       local.soft.push(tube(a, b, (t) => [lerp(rA, rB, t), lerp(rA, rB, t) * 0.92], 8, 2, s === 0, s === 2));
+      /*
+       * Armoured plate over the proximal and middle phalanx.
+       *
+       * The three tubes alone segment the finger, but at gameplay distance
+       * three shaded bumps read as wrinkles. A hard plate riding the outside
+       * of each segment is what turns them into *glove* segments: it catches a
+       // hard-material highlight per phalanx, exactly where a tactical glove
+       * carries its armour, and it makes the joint gaps read as gaps.
+       */
+      if (s < 2) {
+        const phiMid = (phi[s] + phi[s + 1]) * 0.5;
+        const segLen = b.distanceTo(a);
+        // Local frame of the wrap arc: the outward normal and the tangent the
+        // plate's long axis has to follow as the finger curls round the grip.
+        const tx = -Math.sin(phiMid) * away;
+        const ty = -Math.cos(phiMid);
+        const plateAt = new Vector3(
+          rod.x + away * Math.cos(phiMid) * (radii[s] + r0 * 0.52),
+          rod.y - Math.sin(phiMid) * (radii[s] + r0 * 0.52),
+          z,
+        );
+        local.hard.push(tint(box(
+          plateAt,
+          r0 * 0.78,
+          segLen * 0.68,
+          r0 * 2.15,
+          Math.atan2(-tx, ty),
+        ), RUBBER));
+      }
     }
   }
 

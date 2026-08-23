@@ -90,8 +90,16 @@ export class Engine {
     // ACES gives the highlight rolloff that keeps muzzle flashes and perk neon
     // from clipping to flat white.
     this.renderer.toneMapping = ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.15;
+    // Night-sculpting exposure: the high tier sits at 0.90 so the Main Hall
+    // doorway path keeps graded detail through ACES' shoulder instead of
+    // landing as flat white, and so the GradePass shadow floor (not raw
+    // gain) defines where blacks live. Lower tiers stay at 1.0 — they lose
+    // bloom/shadow resolution elsewhere and need the extra stop.
+    this.renderer.toneMappingExposure = quality.preset === 'high' ? 0.9 : 1.0;
     this.renderer.shadowMap.enabled = quality.shadows;
+    // Three 0.185 folds the legacy soft-shadow mode into PCFShadowMap and
+    // warns when PCFSoftShadowMap is selected, so keep the stable supported
+    // mode across tiers.
     this.renderer.shadowMap.type = PCFShadowMap;
     container.appendChild(this.renderer.domElement);
 
@@ -100,30 +108,57 @@ export class Engine {
     // weapon, which is the object the player stares at all game.
     this.viewCamera = new PerspectiveCamera(58, window.innerWidth / window.innerHeight, 0.008, 12);
 
-    // The far plane of the fog has to clear the longest interior sightline or
-    // the back wall of a big room fades to flat haze: the train shed is 44 m
-    // across and the loading yard 55 m long.
-    this.scene.fog = new Fog(0x11141d, 12, 104);
+    // Depth layering over flat distance falloff: lifting the near plane keeps
+    // the sodium pools right around the player crisp while mid-distance gains
+    // a readable haze gradient, so lit areas separate from the dark between
+    // them. FogExp2 was considered (0.02+) but at those densities the 44 m
+    // train-shed back wall sits ~60% fogged — exactly the flat mid-ground
+    // haze the identity avoids — so linear with a lifted start layers better.
+    // The near start sits just past the pool radius (13 m) so pools stay
+    // crisp while everything from there to the shed wall climbs a gentle,
+    // slightly lifted haze ramp: pools → haze → dark, three readable layers.
+    this.scene.fog = new Fog(0x1b2233, 13, 110);
     // Open-air areas look straight up at this. Without a background the sky is
     // the clear colour — pure black — and the fogged skyline silhouettes have
-    // nothing to sit against. Slightly darker than the fog so distant mass
-    // still reads lighter than the sky.
-    this.scene.background = new Color(0x090c13);
+    // nothing to sit against. Tuned a touch bluer/lifted so it reads as the
+    // base of the horizon glow rather than a hole, yet stays clearly darker
+    // than the fog so distant mass still reads lighter than the sky.
+    this.scene.background = new Color(0x0a0e17);
     this.scene.environment = buildEnvironment(this.renderer);
-    this.scene.environmentIntensity = 0.85;
+    // A little neutral bounce keeps rough plaster and the underside of the
+    // ceiling from collapsing into black while the local sodium fixtures keep
+    // the terminal's warm/cool contrast.
+    this.scene.environmentIntensity = 0.9;
+    // Directional fill so shadow SIDES carry shape, not just shadow floors:
+    // IBL is view-dependent and dies on surfaces facing away from the env
+    // strips, which is how shadow sides crushed to flat black (key:fill far
+    // past 4:1). The cool blue-grey sky term models night air; the warm
+    // asphalt-brown ground term fakes sodium bounce off the yard surface.
+    // At 0.30 it lands key:fill ≈4:1 — blacks lift enough that a wall's
+    // unlit face still reads as a plane at an angle, while the pools stay
+    // unambiguously night.
+    this.scene.add(new HemisphereLight(0x44546c, 0x2b2118, 0.3));
     this.viewScene.environment = this.scene.environment;
-    this.viewScene.environmentIntensity = 0.9;
+    // Richer IBL on the weapon, held just under 1.0: the far specular strips
+    // give gunmetal its life, but a full 1.0 stacked on the strengthened rim
+    // starts to flatten the three-point rig's modelling.
+    this.viewScene.environmentIntensity = 0.95;
     this.lightViewModel();
 
     this.composer = new EffectComposer(this.renderer);
     this.renderPass = new RenderPass(this.scene, this.camera);
     this.composer.addPass(this.renderPass);
 
+    // Restraint pass: the previous rig (0.18 / 0.34 / 1.08) bloomed every
+    // practical past silhouette into white/red haze — everything glowed,
+    // nothing read. Now the mip chain only catches true emitters (bulb cards
+    // sit at ~1.5 linear) and spreads a tight halo, so tube and sign SHAPES
+    // survive their own glow instead of smearing over their housings.
     this.bloom = new UnrealBloomPass(
       new Vector2(window.innerWidth, window.innerHeight),
-      0.3, // strength — enough to bloom lamps and muzzle flash, not the walls
-      0.7, // radius
-      1.05, // threshold: only genuinely over-range pixels bloom
+      0.10, // faint halo only: strong enough to sell emission, too weak to wash the fixture around it
+      0.32, // tight spread stops at the fixture edge instead of bleeding onto the housing
+      1.4,  // well above lit plaster (~<1.0) yet under the bulb cards (~1.5): only real emitters qualify
     );
     this.bloom.enabled = quality.bloom;
     this.composer.addPass(this.bloom);
@@ -142,20 +177,50 @@ export class Engine {
    * which is what you want for the object the player stares at all game.
    */
   private lightViewModel() {
-    const key = new DirectionalLight(0xffe6c4, 2.6);
-    key.position.set(0.6, 1.2, 0.4);
+    // Warm-neutral key: bright enough to model the receiver with ACES headroom
+    // but pulled toward white so brass/wood stay honest rather than orange.
+    const key = new DirectionalLight(0xffe0ba, 2.3);
+    key.position.set(0.65, 1.25, 0.45);
     this.viewScene.add(key);
 
-    const fill = new DirectionalLight(0x9fc0ff, 1.1);
+    // Cool fill, dialed back so the warm/cool split across the weapon reads as
+    // intentional cinematography instead of flat ambient.
+    const fill = new DirectionalLight(0x9fc0ff, 0.85);
     fill.position.set(-0.9, -0.2, 0.6);
     this.viewScene.add(fill);
 
-    // Rim from behind picks out the weapon's silhouette against dark rooms.
-    const rim = new PointLight(0xffd0a0, 3.2, 4, 2);
-    rim.position.set(-0.35, 0.3, -0.8);
+    // Rim from behind-above in colder blue: separates the silhouette from dark
+    // rooms and makes gunmetal read premium against the sodium world. 3.3 so
+    // edge highlights on the receiver stay crisp even when the strengthened
+    // IBL strips sit at unfavourable angles for the current pose. Pulled left
+    // of dead-behind and given range to spare: verified in the ADS pose, where
+    // the weapon rides lower and closer to the camera — a rim parked straight
+    // behind it only lights faces the camera can't see, so its hot core has to
+    // land on the upper-LEFT silhouette to register.
+    const rim = new PointLight(0xa8ccff, 3.3, 6, 2);
+    rim.position.set(-0.55, 0.7, -0.7);
     this.viewScene.add(rim);
 
-    this.viewScene.add(new HemisphereLight(0x9fb4d8, 0x2a2622, 0.7));
+    // Second rim as a directional from behind-LEFT: the point rim only
+    // grazes surfaces near its position, so on wide receivers (shotgun,
+    // rifle) the left edge could fall back into the wall behind it. A
+    // directional hits every frame pose identically, so the receiver's
+    // left/back edges always carry a cool #9fb6d8 highlight that separates
+    // them from dark walls — viewmodel separation is an edge job, and this
+    // guarantees the edge exists. 2.6 rather than a token 1.6: pixel-sampled
+    // ADS verification showed 1.6 left the slide at background luminance
+    // (gun mean 27/255 vs wall 34/255) — dark albedo through ACES at 0.9
+    // exposure eats a weak rim whole. Angled well left so the light rakes
+    // the left flank, the face the camera actually sees in ADS.
+    const rimDir = new DirectionalLight(0x9fb6d8, 2.6);
+    // Behind (-z) and hard left (-x), slightly above eye line: light rakes
+    // along the weapon's left flank toward the camera.
+    rimDir.position.set(-1.15, 0.5, -0.7);
+    this.viewScene.add(rimDir);
+
+    // Hemisphere ambient biased blue so shadowed metal carries sky colour, not
+    // gray; the ground tint keeps just enough warmth for bounce continuity.
+    this.viewScene.add(new HemisphereLight(0xaac6f0, 0x22262e, 0.66));
   }
 
   add(system: Updatable) {
@@ -173,8 +238,9 @@ export class Engine {
    * hands back the resulting texture, for an optic to display at its ocular.
    *
    * The camera copies the player's own world transform, so the sight picture
-   * tracks the view exactly — including recoil and sway — and only its field of
-   * view differs. Call once per frame, before the main render.
+   * tracks the view exactly while weapon recoil remains a viewmodel/reticle
+   * effect. Only its field of view differs. Call once per frame, before the
+   * main render.
    */
   renderScopeView(fovDegrees: number): Texture {
     this.scopeFrame++;

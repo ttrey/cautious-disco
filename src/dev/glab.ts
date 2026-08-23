@@ -49,7 +49,7 @@ document.body.appendChild(renderer.domElement);
 
 /* --- Backdrop, standing in for the level ----------------------------- */
 const world = new Scene();
-world.background = new Color(0x090c13);
+world.background = new Color(0x101820);
 world.fog = new Fog(0x11141d, 12, 104);
 const env = buildEnvironment(renderer);
 world.environment = env;
@@ -60,13 +60,13 @@ worldCamera.position.set(0, 1.6, 0);
 
 const wall = new Mesh(
   new PlaneGeometry(40, 12),
-  makeSurface('concrete', { repeat: 8, tint: 0x6d6f74 }) as MeshStandardMaterial,
+  makeSurface('concrete', { repeat: 8, tint: 0x85898e }) as MeshStandardMaterial,
 );
 wall.position.set(0, 3, -30);
 world.add(wall);
 const floor = new Mesh(
   new PlaneGeometry(40, 40),
-  makeSurface('concrete', { repeat: 10, tint: 0x4c4e53 }) as MeshStandardMaterial,
+  makeSurface('concrete', { repeat: 10, tint: 0x454b52 }) as MeshStandardMaterial,
 );
 floor.rotation.x = -Math.PI / 2;
 world.add(floor);
@@ -80,10 +80,13 @@ for (const [i, dist] of [4, 8, 14, 22].entries()) {
   post.position.set((i - 1.5) * 1.2, 0.9, -dist);
   world.add(post);
 }
-world.add(new HemisphereLight(0x9fb4d8, 0x2a2622, 1.1));
+world.add(new HemisphereLight(0x9fb4d8, 0x2a2622, 1.35));
 const sun = new DirectionalLight(0xffe6c4, 1.4);
 sun.position.set(2, 6, 2);
 world.add(sun);
+const rangeFill = new DirectionalLight(0x9fbde3, 0.7);
+rangeFill.position.set(-4, 3, -10);
+world.add(rangeFill);
 
 /* --- Viewmodel pass, identical to Engine ----------------------------- */
 const viewScene = new Scene();
